@@ -574,6 +574,9 @@ public:
       temporal_motion_format_ = WMTPixelFormatInvalid;
       temporal_needs_reset_ = true;
       d32s8_unsuitable_depth_seen_ = false;
+      metalfx_skip_temporal_encode_this_present_ = false;
+      metalfx_temporal_encode_skip_reason_.clear();
+      present_dm_log_pending_ = false;
       metalfx_stable_present_streak_ = 0;
       metalfx_stable_depth_tex_ = nullptr;
       metalfx_stable_motion_tex_ = nullptr;
@@ -833,14 +836,18 @@ public:
     // before MetalFX encode. Temporal path binds those textures for upscale;
     // FI encode is a separate opt-in. Spatial stays color-only. Prev-color GPU
     // update is deferred until after emitcc so a future FI tip still sees prior.
+    // Temporal present-dm encode label is deferred until after skip/encode
+    // decision so we never claim encode=bound on a skipped Present (crash F).
     const bool export_dm = present_dm::enabled();
+    if constexpr (kTemporal) {
+      metalfx_skip_temporal_encode_this_present_ = false;
+      metalfx_temporal_encode_skip_reason_.clear();
+    }
     if (export_dm) {
       if constexpr (kTemporal)
-        // Honest label: export binds depth/motion for temporal upscale; FI may
-        // never run (default). Do not claim temporal_interp_encode=bound.
-        ExportPresentDepthMotion("temporal_upscale_encode=color+depth+motion_bound");
+        ExportPresentDepthMotion(/*defer_present_dm_log=*/true);
       else
-        ExportPresentDepthMotion("spatial_encode=color_only");
+        ExportPresentDepthMotion(/*defer_present_dm_log=*/false, "spatial_encode=color_only");
     }
 
     double vsync_duration =
@@ -884,9 +891,33 @@ public:
       // Depth must be bindable R32Float/Depth32Float — never encode with Invalid/D32S8.
       // Upscale-only boot: interpolated_backbuffer_ is reserved for opt-in FI; temporal
       // encode only needs scaler + upscaled backbuffer.
-      const bool encoded = depth_tex && motion_tex && depth_bind_fmt != WMTPixelFormatInvalid &&
-                           EnsureTemporalScaler(depth_tex, motion_tex) && upscaled_backbuffer_;
+      const bool bindings_ok = depth_tex && motion_tex && depth_bind_fmt != WMTPixelFormatInvalid &&
+                               upscaled_backbuffer_;
+      // Ensure may (re)create scaler — that Present must skip encode (crash F class).
+      const bool scaler_ok = bindings_ok && EnsureTemporalScaler(depth_tex, motion_tex);
       UpdateMetalFXStabilityStreak(depth_tex, motion_tex);
+      // Never MetalFX-encode in the same Present as identity/format/transition churn,
+      // scaler (re)create, estimate realloc, or temporal_needs_reset_ edge.
+      if (estimate_depth_reallocated_this_export_)
+        MarkTemporalEncodeSkip("skip_reason=estimate_depth_realloc");
+      if (estimate_motion_reallocated_this_export_)
+        MarkTemporalEncodeSkip("skip_reason=estimate_motion_realloc");
+      const bool skip_temporal_encode =
+          metalfx_skip_temporal_encode_this_present_ || !bindings_ok || !scaler_ok;
+      const bool encoded = !skip_temporal_encode;
+      {
+        const char *temporal_tag =
+            encoded ? "color+depth+motion_bound"
+                    : (!metalfx_temporal_encode_skip_reason_.empty()
+                           ? metalfx_temporal_encode_skip_reason_.c_str()
+                           : "skip_reason=temporal_bind_unsafe");
+        if (!encoded)
+          LogTemporalEncodeStrategy(temporal_tag);
+        if (export_dm) {
+          std::string dm_label = std::string("temporal_upscale_encode=") + temporal_tag;
+          FlushPresentDmLog(dm_label.c_str());
+        }
+      }
       // Crash E tip: default never create/encode FrameInterpolator. Opt-in later via
       // DXMT_METALFX_UNIFIED_FI=1 (still subject to streak / identity preempt).
       const bool fi_gate = UnifiedFiEncodeEnabled();
@@ -968,7 +999,8 @@ public:
           scaler_info.output_width = upscaled->width();
           scaler_info.output_height = upscaled->height();
 
-          if (!depth || !motion || !scaler || depth_bind_fmt == WMTPixelFormatInvalid) {
+          if (!depth || !motion || !scaler || !scaler->scaler() ||
+              depth_bind_fmt == WMTPixelFormatInvalid) {
             WARN(
                 "unified-metalfx: temporal encode aborted (nil depth/motion/scaler) — "
                 "presenting pre-upscale backbuffer"
@@ -1637,11 +1669,13 @@ private:
     // Drop FI first so in-flight emitcc cannot attach to a dying scaler pair.
     metalfx_frame_interpolator_ = nullptr;
     metalfx_temporal_scaler_ = new TemporalScaler(device_->GetMTLDevice(), info);
-    if (!metalfx_temporal_scaler_) {
+    if (!metalfx_temporal_scaler_ || !metalfx_temporal_scaler_->scaler()) {
       ERR("unified-metalfx: TemporalScaler create failed");
+      metalfx_temporal_scaler_ = nullptr;
       temporal_bound_depth_tex_ = nullptr;
       temporal_bound_motion_tex_ = nullptr;
       metalfx_stable_present_streak_ = 0;
+      MarkTemporalEncodeSkip("skip_reason=scaler_create_failed");
       return false;
     }
     temporal_depth_format_ = depth_fmt;
@@ -1660,11 +1694,14 @@ private:
     metalfx_stable_motion_tex_ = nullptr;
     metalfx_stable_scaler_ = nullptr;
     metalfx_stable_fi_ = nullptr;
+    // Crash F class: never encode in the same Present as scaler (re)create.
+    MarkTemporalEncodeSkip("skip_reason=scaler_recreate");
     WARN(
         "unified-metalfx: TemporalScaler created (attachable for FrameInterpolator) "
         "in=", in_w, "x", in_h, " out=", out_w, "x", out_h,
         " depth_fmt=", (uint32_t)depth_fmt, " src_depth_fmt=", (uint32_t)depth->pixelFormat(),
-        " motion_fmt=", (uint32_t)motion_fmt
+        " motion_fmt=", (uint32_t)motion_fmt,
+        " — temporal encode skipped this Present"
     );
     return true;
   }
@@ -1758,7 +1795,12 @@ private:
     temporal_bound_motion_tex_ = nullptr;
     if constexpr (kTemporal) {
       metalfx_frame_interpolator_ = nullptr;
-      LogFiEncodeStrategy(std::string("skip_reason=identity_changed:") + reason);
+      // Destroy live scaler too — emitcc must not encode against churned estimate infra.
+      metalfx_temporal_scaler_ = nullptr;
+      temporal_depth_format_ = WMTPixelFormatInvalid;
+      std::string skip = std::string("skip_reason=identity_changed:") + (reason ? reason : "unknown");
+      MarkTemporalEncodeSkip(skip.c_str());
+      LogFiEncodeStrategy(skip);
     }
   }
 
@@ -1784,6 +1826,35 @@ private:
       metalfx_stable_scaler_ = scaler_id;
       metalfx_stable_fi_ = fi_id;
     }
+  }
+
+  void MarkTemporalEncodeSkip(const char *reason) {
+    if (!reason)
+      return;
+    metalfx_skip_temporal_encode_this_present_ = true;
+    // Keep the first (most specific) reason for this Present.
+    if (metalfx_temporal_encode_skip_reason_.empty())
+      metalfx_temporal_encode_skip_reason_ = reason;
+  }
+
+  void LogTemporalEncodeStrategy(const char *tag) {
+    if (!tag)
+      return;
+    if (last_temporal_encode_log_ == tag)
+      return;
+    last_temporal_encode_log_ = tag;
+    WARN("unified-metalfx: temporal_encode=", tag);
+  }
+
+  void FlushPresentDmLog(const char *encode_label) {
+    if (!present_dm_log_pending_)
+      return;
+    present_dm_log_pending_ = false;
+    present_dm::logPresentTick(
+        presentation_count_ + 1, backbuffer_desc_.Width, backbuffer_desc_.Height,
+        present_dm_prev_valid_, present_dm_depth_prov_, present_dm_motion_prov_,
+        present_dm_depth_fmt_, encode_label ? encode_label : "temporal_upscale_encode=unknown"
+    );
   }
 
   void LogEncodeBindStrategy(const char *bind) {
@@ -1814,7 +1885,7 @@ private:
     LogFiEncodeStrategy(std::string(tag));
   }
 
-  void ExportPresentDepthMotion(const char *encode_label) {
+  void ExportPresentDepthMotion(bool defer_present_dm_log, const char *encode_label = nullptr) {
     EnsurePresentPrevColorTexture();
     const bool prev_valid = present_prev_color_valid_ && present_prev_color_;
     const char *depth_prov = present_dm::kDepthMissing;
@@ -1859,13 +1930,21 @@ private:
           metalfx_stable_motion_tex_ = nullptr;
           metalfx_stable_scaler_ = nullptr;
           metalfx_stable_fi_ = nullptr;
-          // Drop any live FI; tip-09 never encodes FI by default anyway.
-          if constexpr (kTemporal)
+          if constexpr (kTemporal) {
+            // Crash F: destroy TemporalScaler on unsuitable transition — never
+            // encode across this Present; present pre-upscale backbuffer instead.
             metalfx_frame_interpolator_ = nullptr;
+            metalfx_temporal_scaler_ = nullptr;
+            temporal_bound_depth_tex_ = nullptr;
+            temporal_bound_motion_tex_ = nullptr;
+            temporal_depth_format_ = WMTPixelFormatInvalid;
+            MarkTemporalEncodeSkip("skip_reason=d32s8_transition");
+            LogTemporalEncodeStrategy("skip_reason=d32s8_transition");
+          }
           LogFiEncodeStrategy("skip_reason=d32s8_unsuitable_transition");
           WARN(
-              "unified-metalfx: D32S8 unsuitable transition — temporal_needs_reset + "
-              "stable streak cleared (estimate id may be unchanged)"
+              "unified-metalfx: D32S8 unsuitable transition — TemporalScaler destroyed; "
+              "temporal encode skipped this Present; streak cleared"
           );
         }
         depth_prov = present_dm::kDepthMissing;
@@ -1915,6 +1994,7 @@ private:
         present_depth_ = nullptr;
         depth_prov = present_dm::kDepthEstimateFailed;
         depth_fmt = DXGI_FORMAT_UNKNOWN;
+        OnMetalFXDepthOrMotionIdentityChanged("estimate_depth_export_null");
       } else {
         Texture *depth_tex_after =
             present_depth_ && present_depth_->texture() ? present_depth_->texture().ptr() : nullptr;
@@ -1967,6 +2047,7 @@ private:
       if (!FillLabeledMotionEstimateZero(&motion_prov)) {
         present_motion_ = nullptr;
         motion_prov = present_dm::kMotionEstimateFailed;
+        OnMetalFXDepthOrMotionIdentityChanged("estimate_motion_export_null");
       } else {
         Texture *motion_tex_after =
             present_motion_ && present_motion_->texture() ? present_motion_->texture().ptr() : nullptr;
@@ -1988,10 +2069,19 @@ private:
       OnMetalFXDepthOrMotionIdentityChanged("motion_tex_id_change");
     }
 
-    present_dm::logPresentTick(
-        presentation_count_ + 1, backbuffer_desc_.Width, backbuffer_desc_.Height, prev_valid, depth_prov,
-        motion_prov, depth_fmt, encode_label
-    );
+    if (defer_present_dm_log) {
+      present_dm_log_pending_ = true;
+      present_dm_prev_valid_ = prev_valid;
+      present_dm_depth_prov_ = depth_prov;
+      present_dm_motion_prov_ = motion_prov;
+      present_dm_depth_fmt_ = depth_fmt;
+    } else {
+      present_dm::logPresentTick(
+          presentation_count_ + 1, backbuffer_desc_.Width, backbuffer_desc_.Height, prev_valid,
+          depth_prov, motion_prov, depth_fmt,
+          encode_label ? encode_label : "spatial_encode=color_only"
+      );
+    }
     // Prev-color CopyResource is deferred to UpdatePresentPrevColor() after emitcc.
   }
 
@@ -2070,8 +2160,18 @@ private:
   bool estimate_motion_reallocated_this_export_ = false;
   /** Latched after first D32S8 unsuitable skip so transition reset fires once. */
   bool d32s8_unsuitable_depth_seen_ = false;
+  /** Per-Present: skip upscaleTemporal after churn / recreate / D32S8 transition. */
+  bool metalfx_skip_temporal_encode_this_present_ = false;
+  std::string metalfx_temporal_encode_skip_reason_;
   std::string last_encode_bind_log_;
   std::string last_fi_encode_log_;
+  std::string last_temporal_encode_log_;
+  /** Deferred present-dm log until temporal encode/skip decision (honest label). */
+  bool present_dm_log_pending_ = false;
+  bool present_dm_prev_valid_ = false;
+  const char *present_dm_depth_prov_ = nullptr;
+  const char *present_dm_motion_prov_ = nullptr;
+  DXGI_FORMAT present_dm_depth_fmt_ = DXGI_FORMAT_UNKNOWN;
   bool frame_interpolator_unsupported_logged_ = false;
   uint64_t rendered_present_count_ = 0;
   uint64_t presented_present_count_ = 0;
