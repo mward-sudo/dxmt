@@ -60,7 +60,9 @@ prevValidLabel(bool prev_color_valid) {
 bool
 enabled() {
   // Opt-in so daily spatial Present is unchanged unless proof/fork trial sets the env.
-  return env::getEnvVar("DXMT_PRESENT_DEPTH_MOTION") == "1";
+  // Unified temporal Present implies the same export (map: DXMT_METALFX_UNIFIED_TEMPORAL_INTERP).
+  return env::getEnvVar("DXMT_PRESENT_DEPTH_MOTION") == "1" ||
+         env::getEnvVar("DXMT_METALFX_UNIFIED_TEMPORAL_INTERP") == "1";
 }
 
 void
@@ -181,7 +183,8 @@ isLabeledEstimate(const char *provenance) {
 void
 logPresentTick(
     uint64_t presentation_count, UINT color_w, UINT color_h, bool prev_color_valid,
-    const char *depth_provenance, const char *motion_provenance, DXGI_FORMAT depth_format
+    const char *depth_provenance, const char *motion_provenance, DXGI_FORMAT depth_format,
+    const char *encode_label
 ) {
   if (presentation_count > 3 && (presentation_count % 300) != 0)
     return;
@@ -190,6 +193,8 @@ logPresentTick(
   const bool motion_est = isLabeledEstimate(motion_provenance);
   const char *truth =
       (depth_est || motion_est) ? "LABELED_ESTIMATE_NOT_ENGINE_TRUTH" : "real_or_missing";
+  const char *encode =
+      (encode_label && encode_label[0]) ? encode_label : "spatial_encode=color_only";
   WARN(
       "present-dm: Present#", presentation_count, " color=", color_w, "x", color_h,
       " prev_color=", prevValidLabel(prev_color_valid),
@@ -198,7 +203,7 @@ logPresentTick(
       " provenance_truth=", truth,
       " temporal_upscale_count=", temporal,
       " title_temporal_silent=", (temporal == 0) ? "yes" : "no",
-      " spatial_encode=color_only",
+      " ", encode,
       " (also check nvngx.log for EvaluateFeature; expected silence on ETS2 Picture)"
   );
 }

@@ -5,9 +5,11 @@
  * Prefer real inputs. After real motion (and depth, if also missing) fail,
  * allow an explicitly labeled estimate — never unlabeled / invented MVs.
  *
- * Gate: DXMT_PRESENT_DEPTH_MOTION=1 (opt-in; default off so stock spatial
- * Present is unchanged). Spatial encode stays color-only until a follow-on
- * replaces it; this path only retains synchronized buffers + provenance logs.
+ * Gates (either enables export; default off so stock spatial Present is unchanged):
+ *   DXMT_PRESENT_DEPTH_MOTION=1 — export + provenance only (spatial encode stays
+ *     color-only unless the unified path is also selected at CreateSwapChain).
+ *   DXMT_METALFX_UNIFIED_TEMPORAL_INTERP=1 — implies the same export so an
+ *     attachable temporal scaler can bind color/depth/motion on Present.
  */
 #pragma once
 
@@ -17,7 +19,10 @@
 namespace dxmt {
 namespace present_dm {
 
-/** Env DXMT_PRESENT_DEPTH_MOTION=1 enables; unset/0 leaves Present untouched. */
+/**
+ * True when DXMT_PRESENT_DEPTH_MOTION=1 or DXMT_METALFX_UNIFIED_TEMPORAL_INTERP=1.
+ * Unset/0 leaves Present export untouched.
+ */
 bool enabled();
 
 void noteTemporalUpscale(
@@ -64,9 +69,14 @@ constexpr const char *kMotionEstimateFailed = "ESTIMATE_MOTION_FAILED";
 constexpr const char *kDepthEstimateConstantFar = "ESTIMATE_DEPTH_CONSTANT_FAR";
 constexpr const char *kDepthEstimateFailed = "ESTIMATE_DEPTH_FAILED";
 
+/**
+ * @param encode_label Honest Present encode path, e.g.
+ *   "spatial_encode=color_only" or "temporal_encode=color+depth+motion_bound".
+ */
 void logPresentTick(
     uint64_t presentation_count, UINT color_w, UINT color_h, bool prev_color_valid,
-    const char *depth_provenance, const char *motion_provenance, DXGI_FORMAT depth_format
+    const char *depth_provenance, const char *motion_provenance, DXGI_FORMAT depth_format,
+    const char *encode_label
 );
 
 } // namespace present_dm

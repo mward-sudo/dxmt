@@ -115,8 +115,25 @@ public:
   };
 };
 
-template <bool EnableMetalFX>
+/**
+ * Present MetalFX mode:
+ *   Off — stock Present (no MetalFX upscale)
+ *   Spatial — DXMT_METALFX_SPATIAL_SWAPCHAIN (interpolation-off Picture)
+ *   Temporal — DXMT_METALFX_UNIFIED_TEMPORAL_INTERP (attachable temporal scaler;
+ *     FrameInterpolator is a later ticket — not wired here)
+ */
+enum class SwapChainMetalFXMode {
+  Off = 0,
+  Spatial = 1,
+  Temporal = 2,
+};
+
+template <SwapChainMetalFXMode MetalFX>
 class MTLD3D11SwapChain final : public MTLDXGISubObject<IDXGISwapChain4, MTLD3D11Device> {
+  static constexpr bool kUpscale = MetalFX != SwapChainMetalFXMode::Off;
+  static constexpr bool kSpatial = MetalFX == SwapChainMetalFXMode::Spatial;
+  static constexpr bool kTemporal = MetalFX == SwapChainMetalFXMode::Temporal;
+
 public:
   MTLD3D11SwapChain(
       IDXGIFactory1 *pFactory, MTLD3D11Device *pDevice, IMTLDXGIDevice *pDXGIDevice,
@@ -140,7 +157,7 @@ public:
       abort();
     }
 
-    if constexpr (EnableMetalFX) {
+    if constexpr (kUpscale) {
       scale_factor = std::max(Config::getInstance().getOption<float>("d3d11.metalSpatialUpscaleFactor", 2), 1.0f);
     }
 
@@ -523,7 +540,7 @@ public:
     if (present_dm::enabled())
       EnsurePresentPrevColorTexture();
 
-    if constexpr (EnableMetalFX) {
+    if constexpr (kUpscale) {
       D3D11_TEXTURE2D_DESC1 upscaled_desc_ = backbuffer_desc_;
       upscaled_desc_.Height *= scale_factor;
       upscaled_desc_.Width *= scale_factor;
@@ -532,16 +549,32 @@ public:
               device_, &upscaled_desc_, nullptr, reinterpret_cast<ID3D11Texture2D1 **>(&upscaled_backbuffer_)
           )))
         return E_FAIL;
+    }
 
+    if constexpr (kSpatial) {
       WMTFXSpatialScalerInfo info;
       info.input_height = desc_.Height;
       info.input_width = desc_.Width;
       info.output_height = desc_.Height * scale_factor;
       info.output_width = desc_.Width * scale_factor;
       info.color_format = backbuffer_->texture()->pixelFormat();
-      info.output_format =upscaled_backbuffer_->texture()->pixelFormat();
-      metalfx_scaler = new SpatialScaler(device_->GetMTLDevice(), info);
-      D3D11_ASSERT(metalfx_scaler && "otherwise metalfx failed to initialize");
+      info.output_format = upscaled_backbuffer_->texture()->pixelFormat();
+      metalfx_spatial_scaler_ = new SpatialScaler(device_->GetMTLDevice(), info);
+      D3D11_ASSERT(metalfx_spatial_scaler_ && "otherwise metalfx spatial failed to initialize");
+    }
+
+    if constexpr (kTemporal) {
+      // Temporal scaler is created lazily once Present-export depth/motion formats
+      // are known (real or labeled estimate). Invalidate on resize.
+      metalfx_temporal_scaler_ = nullptr;
+      temporal_depth_format_ = WMTPixelFormatInvalid;
+      temporal_motion_format_ = WMTPixelFormatInvalid;
+      temporal_needs_reset_ = true;
+      WARN(
+          "unified-metalfx: temporal Present path armed (input=", desc_.Width, "x", desc_.Height,
+          " output=", (uint32_t)(desc_.Width * scale_factor), "x", (uint32_t)(desc_.Height * scale_factor),
+          ") — FrameInterpolator not wired yet"
+      );
     }
 
     return S_OK;
@@ -775,10 +808,15 @@ public:
       return hr;
     }
 
-    // present-dm: export synchronized color (+prev), optional real depth, motion
-    // provenance — before spatial upscale encode. Does not wire FrameInterpolator.
-    if (present_dm::enabled())
-      ExportPresentDepthMotion();
+    // present-dm: export synchronized color (+prev), depth, motion provenance
+    // before MetalFX encode. Temporal path binds those textures; spatial stays
+    // color-only. Does not wire FrameInterpolator (ticket 03).
+    if (present_dm::enabled()) {
+      if constexpr (kTemporal)
+        ExportPresentDepthMotion("temporal_encode=color+depth+motion_bound");
+      else
+        ExportPresentDepthMotion("spatial_encode=color_only");
+    }
 
     double vsync_duration =
         std::max(SyncInterval * 1.0 /
@@ -793,12 +831,12 @@ public:
       auto output = static_cast<MTLDXGIOutput *>(target_.ptr());
       presenter->changeGammaRamp(output->GetGammaRamp());
     }
-    if constexpr (EnableMetalFX) {
+    if constexpr (kSpatial) {
       chunk->emitcc([
         this, vsync_duration, backbuffer = backbuffer_->texture(),
         sync_state = SyncFrame(++presentation_count_),
         upscaled = upscaled_backbuffer_->texture(),
-        scaler = this->metalfx_scaler, state = presenter->synchronizeLayerProperties()
+        scaler = this->metalfx_spatial_scaler_, state = presenter->synchronizeLayerProperties()
       ](ArgumentEncodingContext &ctx) mutable {
         auto &scaler_info = ctx.currentFrameStatistics().last_scaler_info;
         scaler_info.type = ScalerType::Spatial;
@@ -811,6 +849,76 @@ public:
         ReleaseSemaphore(present_semaphore_, 1, nullptr);
         this->UpdateStatistics(ctx.queue().statistics, ctx.currentFrameId());
       });
+    } else if constexpr (kTemporal) {
+      Rc<Texture> depth_tex = present_depth_ ? present_depth_->texture() : nullptr;
+      Rc<Texture> motion_tex = present_motion_ ? present_motion_->texture() : nullptr;
+      const bool encoded = depth_tex && motion_tex && EnsureTemporalScaler(depth_tex, motion_tex);
+      if (!encoded) {
+        WARN(
+            "unified-metalfx: temporal encode skipped (depth=", (bool)depth_tex,
+            " motion=", (bool)motion_tex, " scaler=", (bool)metalfx_temporal_scaler_,
+            ") — presenting pre-upscale backbuffer"
+        );
+        chunk->emitcc([
+          this, vsync_duration, state = presenter->synchronizeLayerProperties(),
+          sync_state = SyncFrame(++presentation_count_),
+          backbuffer = backbuffer_->texture()
+        ](ArgumentEncodingContext &ctx) mutable {
+          ctx.present(backbuffer, presenter, vsync_duration, state.metadata);
+          ReleaseSemaphore(present_semaphore_, 1, nullptr);
+          this->UpdateStatistics(ctx.queue().statistics, ctx.currentFrameId());
+        });
+      } else {
+        const bool reset = temporal_needs_reset_;
+        temporal_needs_reset_ = false;
+        const uint32_t content_w = backbuffer_desc_.Width;
+        const uint32_t content_h = backbuffer_desc_.Height;
+        chunk->emitcc([
+          this, vsync_duration, backbuffer = backbuffer_->texture(),
+          sync_state = SyncFrame(++presentation_count_),
+          upscaled = upscaled_backbuffer_->texture(), depth = std::move(depth_tex),
+          motion = std::move(motion_tex), scaler = this->metalfx_temporal_scaler_,
+          motion_format = temporal_motion_format_, reset, content_w, content_h,
+          state = presenter->synchronizeLayerProperties()
+        ](ArgumentEncodingContext &ctx) mutable {
+          auto &scaler_info = ctx.currentFrameStatistics().last_scaler_info;
+          scaler_info.type = ScalerType::Temporal;
+          scaler_info.auto_exposure = true;
+          scaler_info.motion_vector_highres = false;
+          scaler_info.input_width = content_w;
+          scaler_info.input_height = content_h;
+          scaler_info.output_width = upscaled->width();
+          scaler_info.output_height = upscaled->height();
+
+          auto mv_view = motion->createView({
+              .format = motion_format,
+              .type = WMTTextureType2D,
+              .firstMiplevel = 0,
+              .miplevelCount = 1,
+              .firstArraySlice = 0,
+              .arraySize = 1,
+          });
+          Rc<Texture> exposure;
+          WMTFXTemporalScalerProps props{};
+          props.input_content_width = content_w;
+          props.input_content_height = content_h;
+          props.reset = reset;
+          // Labeled depth estimate is conventional far=1; real tracked depth may be
+          // reversed-Z — not forged here; ticket 03/polish can refine.
+          props.depth_reversed = false;
+          props.motion_vector_scale_x = float(content_w);
+          props.motion_vector_scale_y = float(content_h);
+          props.jitter_offset_x = 0.f;
+          props.jitter_offset_y = 0.f;
+          props.pre_exposure = 1.f;
+          ctx.upscaleTemporal(
+              backbuffer, upscaled, depth, motion, mv_view, exposure, scaler, props
+          );
+          ctx.present(upscaled, presenter, vsync_duration, state.metadata);
+          ReleaseSemaphore(present_semaphore_, 1, nullptr);
+          this->UpdateStatistics(ctx.queue().statistics, ctx.currentFrameId());
+        });
+      }
     } else {
       chunk->emitcc([
         this, vsync_duration, state = presenter->synchronizeLayerProperties(),
@@ -1240,7 +1348,93 @@ private:
     return true;
   }
 
-  void ExportPresentDepthMotion() {
+  static WMTPixelFormat CorrectMotionVectorFormat(WMTPixelFormat format) {
+    switch (format) {
+    case WMTPixelFormatRG16Uint:
+    case WMTPixelFormatRG16Float:
+    case WMTPixelFormatRG16Sint:
+    case WMTPixelFormatRG16Snorm:
+    case WMTPixelFormatRG16Unorm:
+      return WMTPixelFormatRG16Float;
+    case WMTPixelFormatRG32Uint:
+    case WMTPixelFormatRG32Float:
+    case WMTPixelFormatRG32Sint:
+      return WMTPixelFormatRG32Float;
+    case WMTPixelFormatRGBA16Sint:
+    case WMTPixelFormatRGBA16Snorm:
+    case WMTPixelFormatRGBA16Uint:
+    case WMTPixelFormatRGBA16Unorm:
+    case WMTPixelFormatRGBA16Float:
+      return WMTPixelFormatRGBA16Float;
+    default:
+      break;
+    }
+    return WMTPixelFormatInvalid;
+  }
+
+  /** Create / refresh attachable MTLFXTemporalScaler for Present (ticket 02). */
+  bool EnsureTemporalScaler(Rc<Texture> &depth, Rc<Texture> &motion) {
+    if constexpr (!kTemporal)
+      return false;
+    if (!depth || !motion || !backbuffer_ || !upscaled_backbuffer_)
+      return false;
+    WMTPixelFormat motion_fmt = CorrectMotionVectorFormat(motion->pixelFormat());
+    if (motion_fmt == WMTPixelFormatInvalid) {
+      ERR("unified-metalfx: invalid Present motion format ", motion->pixelFormat());
+      return false;
+    }
+    WMTPixelFormat depth_fmt = depth->pixelFormat();
+    WMTPixelFormat color_fmt = backbuffer_->texture()->pixelFormat();
+    WMTPixelFormat output_fmt = upscaled_backbuffer_->texture()->pixelFormat();
+    const uint32_t in_w = backbuffer_desc_.Width;
+    const uint32_t in_h = backbuffer_desc_.Height;
+    const uint32_t out_w = (uint32_t)(desc_.Width * scale_factor);
+    const uint32_t out_h = (uint32_t)(desc_.Height * scale_factor);
+    if (metalfx_temporal_scaler_ && temporal_depth_format_ == depth_fmt &&
+        temporal_motion_format_ == motion_fmt && temporal_color_format_ == color_fmt &&
+        temporal_output_format_ == output_fmt && temporal_input_width_ == in_w &&
+        temporal_input_height_ == in_h && temporal_output_width_ == out_w &&
+        temporal_output_height_ == out_h) {
+      return true;
+    }
+
+    WMTFXTemporalScalerInfo info{};
+    info.color_format = color_fmt;
+    info.output_format = output_fmt;
+    info.depth_format = depth_fmt;
+    info.motion_format = motion_fmt;
+    info.input_width = in_w;
+    info.input_height = in_h;
+    info.output_width = out_w;
+    info.output_height = out_h;
+    info.auto_exposure = true;
+    info.input_content_properties_enabled = true;
+    info.input_content_min_scale = 1.0f;
+    info.input_content_max_scale = 3.0f;
+    info.requires_synchronous_initialization = true;
+    metalfx_temporal_scaler_ = new TemporalScaler(device_->GetMTLDevice(), info);
+    if (!metalfx_temporal_scaler_) {
+      ERR("unified-metalfx: TemporalScaler create failed");
+      return false;
+    }
+    temporal_depth_format_ = depth_fmt;
+    temporal_motion_format_ = motion_fmt;
+    temporal_color_format_ = color_fmt;
+    temporal_output_format_ = output_fmt;
+    temporal_input_width_ = in_w;
+    temporal_input_height_ = in_h;
+    temporal_output_width_ = out_w;
+    temporal_output_height_ = out_h;
+    temporal_needs_reset_ = true;
+    WARN(
+        "unified-metalfx: TemporalScaler created (attachable; interpolator not wired) "
+        "in=", in_w, "x", in_h, " out=", out_w, "x", out_h,
+        " depth_fmt=", (uint32_t)depth_fmt, " motion_fmt=", (uint32_t)motion_fmt
+    );
+    return true;
+  }
+
+  void ExportPresentDepthMotion(const char *encode_label) {
     EnsurePresentPrevColorTexture();
     const bool prev_valid = present_prev_color_valid_ && present_prev_color_;
     const char *depth_prov = present_dm::kDepthMissing;
@@ -1303,7 +1497,7 @@ private:
 
     present_dm::logPresentTick(
         presentation_count_ + 1, backbuffer_desc_.Width, backbuffer_desc_.Height, prev_valid, depth_prov,
-        motion_prov, depth_fmt
+        motion_prov, depth_fmt, encode_label
     );
 
     // Retain current color as previous for the next Present tick (pre-upscale).
@@ -1348,8 +1542,19 @@ private:
 
   bool handle_alt_tab_;
 
-  std::conditional<EnableMetalFX, Rc<SpatialScaler>, std::monostate>::type metalfx_scaler;
-  std::conditional<EnableMetalFX, Com<D3D11ResourceCommon>, std::monostate>::type upscaled_backbuffer_;
+  std::conditional_t<kSpatial, Rc<SpatialScaler>, std::monostate> metalfx_spatial_scaler_;
+  std::conditional_t<kTemporal, Rc<TemporalScaler>, std::monostate> metalfx_temporal_scaler_;
+  std::conditional_t<kUpscale, Com<D3D11ResourceCommon>, std::monostate> upscaled_backbuffer_;
+  // Cached descriptor identity for lazy TemporalScaler recreate.
+  WMTPixelFormat temporal_depth_format_ = WMTPixelFormatInvalid;
+  WMTPixelFormat temporal_motion_format_ = WMTPixelFormatInvalid;
+  WMTPixelFormat temporal_color_format_ = WMTPixelFormatInvalid;
+  WMTPixelFormat temporal_output_format_ = WMTPixelFormatInvalid;
+  uint32_t temporal_input_width_ = 0;
+  uint32_t temporal_input_height_ = 0;
+  uint32_t temporal_output_width_ = 0;
+  uint32_t temporal_output_height_ = 0;
+  bool temporal_needs_reset_ = true;
   float scale_factor = 1.0;
 };
 
@@ -1381,9 +1586,21 @@ CreateSwapChain(
       pDesc->BufferCount != 1) {
     WARN("CreateSwapChain: unsupported swap effect ", pDesc->SwapEffect, " with backbuffer size ", pDesc->BufferCount);
   }
+  // Unified temporal+interp Present (ticket 02: temporal scaler only; interp = 03).
+  // Prefer over spatial so the same tick never runs spatial+sidecar / hybrid.
+  if (env::getEnvVar("DXMT_METALFX_UNIFIED_TEMPORAL_INTERP") == "1") {
+    if (pDevice->GetMTLDevice().supportsFXTemporalScaler()) {
+      *ppSwapChain = new MTLD3D11SwapChain<SwapChainMetalFXMode::Temporal>(
+          pFactory, pDevice, layer_factory.ptr(), hWnd, pDesc, pFullscreenDesc
+      );
+      return S_OK;
+    } else {
+      WARN("MetalFX temporal scaler is not supported on this device (unified path)");
+    }
+  }
   if (env::getEnvVar("DXMT_METALFX_SPATIAL_SWAPCHAIN") == "1") {
     if (pDevice->GetMTLDevice().supportsFXSpatialScaler()) {
-      *ppSwapChain = new MTLD3D11SwapChain<true>(
+      *ppSwapChain = new MTLD3D11SwapChain<SwapChainMetalFXMode::Spatial>(
           pFactory, pDevice, layer_factory.ptr(), hWnd, pDesc, pFullscreenDesc
       );
       return S_OK;
@@ -1391,7 +1608,7 @@ CreateSwapChain(
       WARN("MetalFX spatial scaler is not supported on this device");
     }
   }
-  *ppSwapChain = new MTLD3D11SwapChain<false>(
+  *ppSwapChain = new MTLD3D11SwapChain<SwapChainMetalFXMode::Off>(
       pFactory, pDevice, layer_factory.ptr(), hWnd, pDesc, pFullscreenDesc
   );
   return S_OK;
