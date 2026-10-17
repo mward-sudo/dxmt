@@ -121,7 +121,7 @@ public:
  *   Off — stock Present (no MetalFX upscale)
  *   Spatial — DXMT_METALFX_SPATIAL_SWAPCHAIN (interpolation-off Picture)
  *   Temporal — DXMT_METALFX_UNIFIED_TEMPORAL_INTERP (attachable temporal scaler
- *     + MTLFXFrameInterpolator → single Presenter; no spatial+sidecar)
+ *     → Presenter; FrameInterpolate encode opt-in via DXMT_METALFX_UNIFIED_FI=1)
  */
 enum class SwapChainMetalFXMode {
   Off = 0,
@@ -565,14 +565,22 @@ public:
     }
 
     if constexpr (kTemporal) {
-      // Temporal scaler + FrameInterpolator created lazily once Present-export
-      // depth/motion formats are known. Invalidate on resize.
+      // Temporal scaler created lazily once Present-export depth/motion formats
+      // are known. FI create/encode stays off unless DXMT_METALFX_UNIFIED_FI=1.
       metalfx_temporal_scaler_ = nullptr;
       metalfx_frame_interpolator_ = nullptr;
       interpolated_backbuffer_ = nullptr;
       temporal_depth_format_ = WMTPixelFormatInvalid;
       temporal_motion_format_ = WMTPixelFormatInvalid;
       temporal_needs_reset_ = true;
+      d32s8_unsuitable_depth_seen_ = false;
+      metalfx_stable_present_streak_ = 0;
+      metalfx_stable_depth_tex_ = nullptr;
+      metalfx_stable_motion_tex_ = nullptr;
+      metalfx_stable_scaler_ = nullptr;
+      metalfx_stable_fi_ = nullptr;
+      temporal_bound_depth_tex_ = nullptr;
+      temporal_bound_motion_tex_ = nullptr;
       D3D11_TEXTURE2D_DESC1 interp_desc = backbuffer_desc_;
       interp_desc.Height *= scale_factor;
       interp_desc.Width *= scale_factor;
@@ -583,9 +591,10 @@ public:
         return E_FAIL;
       }
       WARN(
-          "unified-metalfx: temporal+interp Present path armed (input=", desc_.Width, "x", desc_.Height,
-          " output=", (uint32_t)(desc_.Width * scale_factor), "x", (uint32_t)(desc_.Height * scale_factor),
-          ")"
+          "unified-metalfx: temporal upscale-only Present path armed (FI encode disabled until "
+          "DXMT_METALFX_UNIFIED_FI=1) input=",
+          desc_.Width, "x", desc_.Height, " output=", (uint32_t)(desc_.Width * scale_factor), "x",
+          (uint32_t)(desc_.Height * scale_factor)
       );
     }
 
@@ -821,13 +830,15 @@ public:
     }
 
     // present-dm: export synchronized color (+prev), depth, motion provenance
-    // before MetalFX encode. Temporal path binds those textures (+ interpolator);
-    // spatial stays color-only. Prev-color GPU update is deferred until after
-    // emitcc registration so FrameInterpolator still sees the prior frame.
+    // before MetalFX encode. Temporal path binds those textures for upscale;
+    // FI encode is a separate opt-in. Spatial stays color-only. Prev-color GPU
+    // update is deferred until after emitcc so a future FI tip still sees prior.
     const bool export_dm = present_dm::enabled();
     if (export_dm) {
       if constexpr (kTemporal)
-        ExportPresentDepthMotion("temporal_interp_encode=color+depth+motion_bound");
+        // Honest label: export binds depth/motion for temporal upscale; FI may
+        // never run (default). Do not claim temporal_interp_encode=bound.
+        ExportPresentDepthMotion("temporal_upscale_encode=color+depth+motion_bound");
       else
         ExportPresentDepthMotion("spatial_encode=color_only");
     }
@@ -871,19 +882,27 @@ public:
       const WMTPixelFormat depth_bind_fmt =
           depth_tex ? MetalFXSafeDepthFormat(depth_tex->pixelFormat()) : WMTPixelFormatInvalid;
       // Depth must be bindable R32Float/Depth32Float — never encode with Invalid/D32S8.
+      // Upscale-only boot: interpolated_backbuffer_ is reserved for opt-in FI; temporal
+      // encode only needs scaler + upscaled backbuffer.
       const bool encoded = depth_tex && motion_tex && depth_bind_fmt != WMTPixelFormatInvalid &&
-                           EnsureTemporalScaler(depth_tex, motion_tex) && interpolated_backbuffer_;
-      // Hard preempt: FI only after depth identity + scaler/FI unchanged for N>=2 Presents.
+                           EnsureTemporalScaler(depth_tex, motion_tex) && upscaled_backbuffer_;
       UpdateMetalFXStabilityStreak(depth_tex, motion_tex);
+      // Crash E tip: default never create/encode FrameInterpolator. Opt-in later via
+      // DXMT_METALFX_UNIFIED_FI=1 (still subject to streak / identity preempt).
+      const bool fi_gate = UnifiedFiEncodeEnabled();
       const char *fi_skip = nullptr;
       bool have_interp = false;
-      if (!encoded) {
+      if (!fi_gate) {
+        // Prefer skip FI create entirely — remove MetalFX FI from the crash surface.
+        metalfx_frame_interpolator_ = nullptr;
+        fi_skip = "skip_reason=disabled_until_upscale_boot_stable";
+      } else if (!encoded) {
         fi_skip = "skip_reason=temporal_bind_unsafe";
       } else if (!prev_valid) {
         fi_skip = "skip_reason=prev_color_missing";
       } else if (metalfx_stable_present_streak_ < kMetalFXFiStablePresentsRequired) {
         fi_skip = "skip_reason=awaiting_stable_presents";
-      } else if (estimate_depth_reallocated_this_export_) {
+      } else if (estimate_depth_reallocated_this_export_ || estimate_motion_reallocated_this_export_) {
         fi_skip = "skip_reason=estimate_just_reallocated";
       } else if (!EnsureFrameInterpolator(depth_tex, motion_tex)) {
         fi_skip = "skip_reason=fi_unavailable";
@@ -924,14 +943,19 @@ public:
         const uint32_t content_h = backbuffer_desc_.Height;
         const double half_vsync = vsync_duration * 0.5;
         const bool depth_is_estimate = depth_bind_fmt == WMTPixelFormatR32Float;
+        // Capture Rc/scaler by value at emit time so a later Present recreate
+        // cannot leave the queued encode holding a stale FI/scaler pointer.
         chunk->emitcc([
           this, vsync_duration, half_vsync, backbuffer = backbuffer_->texture(),
           sync_state = SyncFrame(++presentation_count_),
           upscaled = upscaled_backbuffer_->texture(),
-          interpolated = interpolated_backbuffer_->texture(), depth = std::move(depth_tex),
-          motion = std::move(motion_tex), prev_color = std::move(prev_color_tex),
+          interpolated = (have_interp && interpolated_backbuffer_)
+                             ? interpolated_backbuffer_->texture()
+                             : Rc<Texture>{},
+          depth = std::move(depth_tex), motion = std::move(motion_tex),
+          prev_color = std::move(prev_color_tex),
           scaler = this->metalfx_temporal_scaler_,
-          interpolator = have_interp ? this->metalfx_frame_interpolator_ : nullptr,
+          interpolator = have_interp ? this->metalfx_frame_interpolator_ : Rc<FrameInterpolator>{},
           motion_format = temporal_motion_format_, depth_bind_fmt, reset, content_w, content_h,
           have_interp, state = presenter->synchronizeLayerProperties()
         ](ArgumentEncodingContext &ctx) mutable {
@@ -993,7 +1017,7 @@ public:
               backbuffer, upscaled, depth, depth_view, motion, mv_view, exposure, scaler, props
           );
           const bool can_interp = have_interp && interpolator && interpolator->interpolator() &&
-                                  prev_color && depth && motion && depth_view &&
+                                  interpolated && prev_color && depth && motion && depth_view &&
                                   depth_bind_fmt != WMTPixelFormatInvalid;
           if (can_interp) {
             WMTFXFrameInterpolatorProps iprops{};
@@ -1033,7 +1057,9 @@ public:
           WARN(
               "unified-metalfx: pacing rendered=", rendered_present_count_,
               " presented=", presented_present_count_,
-              " interp=", (have_interp ? "on" : "off_waiting_prev"),
+              " interp=",
+              (have_interp ? "on"
+                           : (fi_gate ? "off_waiting_stable" : "off_disabled_until_upscale_boot_stable")),
               " depth_bind=",
               (depth_is_estimate ? "ESTIMATE_DEPTH_CONSTANT_FAR" : "real_depth")
           );
@@ -1548,6 +1574,15 @@ private:
     return depth->fullView;
   }
 
+  /**
+   * Opt-in FrameInterpolate encode on the unified temporal path.
+   * Default OFF (crash E tip): upscale-only boot until D32S8 / temporal encode
+   * is proven stable. Later tip may raise N and re-enable behind this gate.
+   */
+  static bool UnifiedFiEncodeEnabled() {
+    return env::getEnvVar("DXMT_METALFX_UNIFIED_FI") == "1";
+  }
+
   /** Create / refresh attachable MTLFXTemporalScaler for Present (ticket 02). */
   bool EnsureTemporalScaler(Rc<Texture> &depth, Rc<Texture> &motion) {
     if constexpr (!kTemporal)
@@ -1637,6 +1672,9 @@ private:
   /** Create / refresh MTLFXFrameInterpolator with desc.scaler = temporal scaler. */
   bool EnsureFrameInterpolator(Rc<Texture> &depth, Rc<Texture> &motion) {
     if constexpr (!kTemporal)
+      return false;
+    // Never allocate MetalFX FI unless the opt-in gate is set (upscale-only boot).
+    if (!UnifiedFiEncodeEnabled())
       return false;
     if (!metalfx_temporal_scaler_ || !depth || !motion || !backbuffer_ || !interpolated_backbuffer_)
       return false;
@@ -1735,7 +1773,7 @@ private:
         depth_id && motion_id && scaler_id && depth_id == metalfx_stable_depth_tex_ &&
         motion_id == metalfx_stable_motion_tex_ && scaler_id == metalfx_stable_scaler_ &&
         fi_id == metalfx_stable_fi_ && !estimate_depth_reallocated_this_export_ &&
-        !temporal_needs_reset_;
+        !estimate_motion_reallocated_this_export_ && !temporal_needs_reset_;
     if (same) {
       if (metalfx_stable_present_streak_ < 0xffffu)
         metalfx_stable_present_streak_++;
@@ -1783,6 +1821,7 @@ private:
     const char *motion_prov = present_dm::kMotionUnavailable;
     DXGI_FORMAT depth_fmt = DXGI_FORMAT_UNKNOWN;
     estimate_depth_reallocated_this_export_ = false;
+    estimate_motion_reallocated_this_export_ = false;
     // Identity of present_depth_ Metal texture before estimate fill — if Fill
     // reallocates, scaler/FI must reset rather than encode against a new id.
     Texture *depth_tex_before_estimate =
@@ -1810,6 +1849,25 @@ private:
             " (D32S8/unsuitable) — skip copy; keep/reuse labeled R32Float "
             "ESTIMATE_DEPTH_CONSTANT_FAR for bind"
         );
+        // Transition into unsuitable real depth: force temporal reset + streak=0
+        // even when the owned R32 estimate texture id is unchanged (crash E).
+        if (!d32s8_unsuitable_depth_seen_) {
+          d32s8_unsuitable_depth_seen_ = true;
+          temporal_needs_reset_ = true;
+          metalfx_stable_present_streak_ = 0;
+          metalfx_stable_depth_tex_ = nullptr;
+          metalfx_stable_motion_tex_ = nullptr;
+          metalfx_stable_scaler_ = nullptr;
+          metalfx_stable_fi_ = nullptr;
+          // Drop any live FI; tip-09 never encodes FI by default anyway.
+          if constexpr (kTemporal)
+            metalfx_frame_interpolator_ = nullptr;
+          LogFiEncodeStrategy("skip_reason=d32s8_unsuitable_transition");
+          WARN(
+              "unified-metalfx: D32S8 unsuitable transition — temporal_needs_reset + "
+              "stable streak cleared (estimate id may be unchanged)"
+          );
+        }
         depth_prov = present_dm::kDepthMissing;
         need_estimate_depth = true;
         // Leave present_depth_ alone when it is already a reusable R32 estimate.
@@ -1834,6 +1892,9 @@ private:
             need_estimate_depth = true;
           } else {
             need_estimate_depth = false;
+            // Suitable real depth — allow a future D32S8 appearance to count as
+            // a fresh unsuitable transition.
+            d32s8_unsuitable_depth_seen_ = false;
           }
         }
       } else {
@@ -1906,12 +1967,24 @@ private:
       if (!FillLabeledMotionEstimateZero(&motion_prov)) {
         present_motion_ = nullptr;
         motion_prov = present_dm::kMotionEstimateFailed;
+      } else {
+        Texture *motion_tex_after =
+            present_motion_ && present_motion_->texture() ? present_motion_->texture().ptr() : nullptr;
+        if (motion_tex_after != motion_tex_before) {
+          // Analogous to estimate depth realloc churn (crash D class).
+          estimate_motion_reallocated_this_export_ = true;
+          OnMetalFXDepthOrMotionIdentityChanged("estimate_motion_realloc");
+          WARN(
+              "unified-metalfx: estimate motion texture (re)allocated — temporal reset; "
+              "encode_bind keeps ESTIMATE_MOTION_ZERO"
+          );
+        }
       }
     }
 
     Texture *motion_tex_now =
         present_motion_ && present_motion_->texture() ? present_motion_->texture().ptr() : nullptr;
-    if (motion_tex_now != motion_tex_before) {
+    if (motion_tex_now != motion_tex_before && !estimate_motion_reallocated_this_export_) {
       OnMetalFXDepthOrMotionIdentityChanged("motion_tex_id_change");
     }
 
@@ -1983,7 +2056,10 @@ private:
   /** Texture identities currently bound into TemporalScaler / FI descriptors. */
   Texture *temporal_bound_depth_tex_ = nullptr;
   Texture *temporal_bound_motion_tex_ = nullptr;
-  /** Hard preempt: FI encode only after N stable Presents (depth+scaler+FI unchanged). */
+  /**
+   * Hard preempt when FI opt-in is enabled: encode only after N stable Presents
+   * (depth+scaler+FI unchanged). Default tip-09 never enables FI encode.
+   */
   static constexpr uint32_t kMetalFXFiStablePresentsRequired = 2u;
   uint32_t metalfx_stable_present_streak_ = 0;
   Texture *metalfx_stable_depth_tex_ = nullptr;
@@ -1991,6 +2067,9 @@ private:
   void *metalfx_stable_scaler_ = nullptr;
   void *metalfx_stable_fi_ = nullptr;
   bool estimate_depth_reallocated_this_export_ = false;
+  bool estimate_motion_reallocated_this_export_ = false;
+  /** Latched after first D32S8 unsuitable skip so transition reset fires once. */
+  bool d32s8_unsuitable_depth_seen_ = false;
   std::string last_encode_bind_log_;
   std::string last_fi_encode_log_;
   bool frame_interpolator_unsupported_logged_ = false;
@@ -2027,14 +2106,15 @@ CreateSwapChain(
       pDesc->BufferCount != 1) {
     WARN("CreateSwapChain: unsupported swap effect ", pDesc->SwapEffect, " with backbuffer size ", pDesc->BufferCount);
   }
-  // Unified temporal+interp Present (scaler + FrameInterpolator on one path).
+  // Unified temporal Present (scaler on one path; FI encode opt-in).
   // Prefer over spatial so the same tick never runs spatial+sidecar / hybrid.
   if (env::getEnvVar("DXMT_METALFX_UNIFIED_TEMPORAL_INTERP") == "1") {
     if (pDevice->GetMTLDevice().supportsFXTemporalScaler()) {
-      if (!pDevice->GetMTLDevice().supportsFXFrameInterpolator()) {
+      if (env::getEnvVar("DXMT_METALFX_UNIFIED_FI") == "1" &&
+          !pDevice->GetMTLDevice().supportsFXFrameInterpolator()) {
         WARN(
             "MetalFX FrameInterpolator unsupported — unified path will upscale only "
-            "until FI is available (still no spatial+sidecar)"
+            "(DXMT_METALFX_UNIFIED_FI ignored; still no spatial+sidecar)"
         );
       }
       *ppSwapChain = new MTLD3D11SwapChain<SwapChainMetalFXMode::Temporal>(
