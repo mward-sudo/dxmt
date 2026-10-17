@@ -574,6 +574,8 @@ public:
       temporal_motion_format_ = WMTPixelFormatInvalid;
       temporal_needs_reset_ = true;
       d32s8_unsuitable_depth_seen_ = false;
+      metalfx_scaler_recreate_cooldown_ = 0;
+      metalfx_scaler_recreate_cooldown_reason_.clear();
       metalfx_skip_temporal_encode_this_present_ = false;
       metalfx_temporal_encode_skip_reason_.clear();
       present_dm_log_pending_ = false;
@@ -893,8 +895,23 @@ public:
       // encode only needs scaler + upscaled backbuffer.
       const bool bindings_ok = depth_tex && motion_tex && depth_bind_fmt != WMTPixelFormatInvalid &&
                                upscaled_backbuffer_;
+      // Crash G: after scaler destroy (D32S8 / identity), do not recreate for N Presents.
+      // Tip-10 skipped encode on the destroy Present but EnsureTemporalScaler still
+      // created on the next Present → page fault while claiming encode skipped.
+      const bool in_scaler_cooldown = metalfx_scaler_recreate_cooldown_ > 0;
+      if (in_scaler_cooldown) {
+        const char *cooldown_tag =
+            metalfx_scaler_recreate_cooldown_reason_.empty()
+                ? "skip_reason=scaler_destroy_cooldown"
+                : metalfx_scaler_recreate_cooldown_reason_.c_str();
+        MarkTemporalEncodeSkip(cooldown_tag);
+        LogTemporalEncodeStrategy(cooldown_tag);
+        metalfx_scaler_recreate_cooldown_--;
+      }
       // Ensure may (re)create scaler — that Present must skip encode (crash F class).
-      const bool scaler_ok = bindings_ok && EnsureTemporalScaler(depth_tex, motion_tex);
+      // Never call Ensure during destroy cooldown (scaler must stay nullptr).
+      const bool scaler_ok =
+          !in_scaler_cooldown && bindings_ok && EnsureTemporalScaler(depth_tex, motion_tex);
       UpdateMetalFXStabilityStreak(depth_tex, motion_tex);
       // Never MetalFX-encode in the same Present as identity/format/transition churn,
       // scaler (re)create, estimate realloc, or temporal_needs_reset_ edge.
@@ -903,7 +920,8 @@ public:
       if (estimate_motion_reallocated_this_export_)
         MarkTemporalEncodeSkip("skip_reason=estimate_motion_realloc");
       const bool skip_temporal_encode =
-          metalfx_skip_temporal_encode_this_present_ || !bindings_ok || !scaler_ok;
+          metalfx_skip_temporal_encode_this_present_ || !bindings_ok || !scaler_ok ||
+          !metalfx_temporal_scaler_;
       const bool encoded = !skip_temporal_encode;
       {
         const char *temporal_tag =
@@ -1615,9 +1633,31 @@ private:
     return env::getEnvVar("DXMT_METALFX_UNIFIED_FI") == "1";
   }
 
+  /**
+   * After destroying TemporalScaler, withhold Ensure/create for N Presents
+   * (crash G: immediate recreate after D32S8 destroy page-faulted).
+   * `cooldown_skip_reason` is logged on subsequent cooldown Presents
+   * (e.g. d32s8_cooldown / identity_destroy_cooldown).
+   */
+  void BeginMetalFXScalerDestroyCooldown(const char *cooldown_skip_reason) {
+    if constexpr (!kTemporal)
+      return;
+    metalfx_frame_interpolator_ = nullptr;
+    metalfx_temporal_scaler_ = nullptr;
+    temporal_bound_depth_tex_ = nullptr;
+    temporal_bound_motion_tex_ = nullptr;
+    temporal_depth_format_ = WMTPixelFormatInvalid;
+    metalfx_scaler_recreate_cooldown_ = kMetalFXScalerRecreateCooldownPresents;
+    metalfx_scaler_recreate_cooldown_reason_ =
+        cooldown_skip_reason ? cooldown_skip_reason : "skip_reason=scaler_destroy_cooldown";
+  }
+
   /** Create / refresh attachable MTLFXTemporalScaler for Present (ticket 02). */
   bool EnsureTemporalScaler(Rc<Texture> &depth, Rc<Texture> &motion) {
     if constexpr (!kTemporal)
+      return false;
+    // Belt: never create during destroy cooldown (caller should also gate).
+    if (metalfx_scaler_recreate_cooldown_ > 0)
       return false;
     if (!depth || !motion || !backbuffer_ || !upscaled_backbuffer_)
       return false;
@@ -1790,14 +1830,12 @@ private:
     metalfx_stable_motion_tex_ = nullptr;
     metalfx_stable_scaler_ = nullptr;
     metalfx_stable_fi_ = nullptr;
-    // Force scaler recreate on next Ensure — format may match but texture id changed.
+    // Force scaler recreate after cooldown — format may match but texture id changed.
     temporal_bound_depth_tex_ = nullptr;
     temporal_bound_motion_tex_ = nullptr;
     if constexpr (kTemporal) {
-      metalfx_frame_interpolator_ = nullptr;
-      // Destroy live scaler too — emitcc must not encode against churned estimate infra.
-      metalfx_temporal_scaler_ = nullptr;
-      temporal_depth_format_ = WMTPixelFormatInvalid;
+      // Same class as crash G: destroy then immediate Ensure create is unsafe.
+      BeginMetalFXScalerDestroyCooldown("skip_reason=identity_destroy_cooldown");
       std::string skip = std::string("skip_reason=identity_changed:") + (reason ? reason : "unknown");
       MarkTemporalEncodeSkip(skip.c_str());
       LogFiEncodeStrategy(skip);
@@ -1933,18 +1971,16 @@ private:
           if constexpr (kTemporal) {
             // Crash F: destroy TemporalScaler on unsuitable transition — never
             // encode across this Present; present pre-upscale backbuffer instead.
-            metalfx_frame_interpolator_ = nullptr;
-            metalfx_temporal_scaler_ = nullptr;
-            temporal_bound_depth_tex_ = nullptr;
-            temporal_bound_motion_tex_ = nullptr;
-            temporal_depth_format_ = WMTPixelFormatInvalid;
+            // Crash G: also withhold Ensure/create for N Presents (no immediate recreate).
+            BeginMetalFXScalerDestroyCooldown("skip_reason=d32s8_cooldown");
             MarkTemporalEncodeSkip("skip_reason=d32s8_transition");
             LogTemporalEncodeStrategy("skip_reason=d32s8_transition");
           }
           LogFiEncodeStrategy("skip_reason=d32s8_unsuitable_transition");
           WARN(
               "unified-metalfx: D32S8 unsuitable transition — TemporalScaler destroyed; "
-              "temporal encode skipped this Present; streak cleared"
+              "encode skipped; recreate cooldown=",
+              kMetalFXScalerRecreateCooldownPresents, " Presents; streak cleared"
           );
         }
         depth_prov = present_dm::kDepthMissing;
@@ -2151,6 +2187,11 @@ private:
    * (depth+scaler+FI unchanged). Default tip-09 never enables FI encode.
    */
   static constexpr uint32_t kMetalFXFiStablePresentsRequired = 2u;
+  /**
+   * After TemporalScaler destroy (D32S8 / identity), withhold Ensure/create
+   * for this many Presents (crash G). N>=3 including the destroy Present.
+   */
+  static constexpr uint32_t kMetalFXScalerRecreateCooldownPresents = 3u;
   uint32_t metalfx_stable_present_streak_ = 0;
   Texture *metalfx_stable_depth_tex_ = nullptr;
   Texture *metalfx_stable_motion_tex_ = nullptr;
@@ -2160,6 +2201,9 @@ private:
   bool estimate_motion_reallocated_this_export_ = false;
   /** Latched after first D32S8 unsuitable skip so transition reset fires once. */
   bool d32s8_unsuitable_depth_seen_ = false;
+  /** Remaining Presents that must not call EnsureTemporalScaler after destroy. */
+  uint32_t metalfx_scaler_recreate_cooldown_ = 0;
+  std::string metalfx_scaler_recreate_cooldown_reason_;
   /** Per-Present: skip upscaleTemporal after churn / recreate / D32S8 transition. */
   bool metalfx_skip_temporal_encode_this_present_ = false;
   std::string metalfx_temporal_encode_skip_reason_;
