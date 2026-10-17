@@ -1,0 +1,12 @@
+# Preferred toolchain entrypoint for this personal DXMT fork (spike).
+# Run from the fork root: `mise install` then `mise exec -- …`
+#
+# Exceptions (not provided by mise; see ets2-recomp fork-build.md):
+# - LLVM 15 libs: build into toolchains/llvm-darwin[-arm64] per docs/DEVELOPMENT.md / CI
+# - Wine headers/tools: DXMT CI wine tarball under toolchains/wine
+# - llvm-mingw (ARM64EC / clang cross): toolchains/llvm-mingw-*
+
+[tools]
+meson = "1.12.1"
+ninja = "1.13.2"
+cmake = "4.4.4"
