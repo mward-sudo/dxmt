@@ -867,15 +867,19 @@ public:
       Rc<Texture> motion_tex = present_motion_ ? present_motion_->texture() : nullptr;
       const bool prev_valid = present_prev_color_valid_ && present_prev_color_;
       Rc<Texture> prev_color_tex = prev_valid ? present_prev_color_->texture() : nullptr;
-      const bool encoded = depth_tex && motion_tex && EnsureTemporalScaler(depth_tex, motion_tex) &&
-                           interpolated_backbuffer_;
+      const WMTPixelFormat depth_bind_fmt =
+          depth_tex ? MetalFXSafeDepthFormat(depth_tex->pixelFormat()) : WMTPixelFormatInvalid;
+      // Depth must be bindable R32Float/Depth32Float — never encode with Invalid/D32S8.
+      const bool encoded = depth_tex && motion_tex && depth_bind_fmt != WMTPixelFormatInvalid &&
+                           EnsureTemporalScaler(depth_tex, motion_tex) && interpolated_backbuffer_;
       const bool have_interp =
           encoded && prev_valid && EnsureFrameInterpolator(depth_tex, motion_tex);
       if (!encoded) {
         WARN(
             "unified-metalfx: temporal encode skipped (depth=", (bool)depth_tex,
-            " motion=", (bool)motion_tex, " scaler=", (bool)metalfx_temporal_scaler_,
-            ") — presenting pre-upscale backbuffer"
+            " motion=", (bool)motion_tex, " depth_bind_fmt=", (uint32_t)depth_bind_fmt,
+            " scaler=", (bool)metalfx_temporal_scaler_,
+            ") — presenting pre-upscale backbuffer (no MetalFX page-fault)"
         );
         chunk->emitcc([
           this, vsync_duration, state = presenter->synchronizeLayerProperties(),
@@ -894,7 +898,7 @@ public:
         const uint32_t content_w = backbuffer_desc_.Width;
         const uint32_t content_h = backbuffer_desc_.Height;
         const double half_vsync = vsync_duration * 0.5;
-        const WMTPixelFormat depth_bind_fmt = MetalFXSafeDepthFormat(depth_tex->pixelFormat());
+        const bool depth_is_estimate = depth_bind_fmt == WMTPixelFormatR32Float;
         chunk->emitcc([
           this, vsync_duration, half_vsync, backbuffer = backbuffer_->texture(),
           sync_state = SyncFrame(++presentation_count_),
@@ -915,6 +919,17 @@ public:
           scaler_info.output_width = upscaled->width();
           scaler_info.output_height = upscaled->height();
 
+          if (!depth || !motion || !scaler || depth_bind_fmt == WMTPixelFormatInvalid) {
+            WARN(
+                "unified-metalfx: temporal encode aborted (nil depth/motion/scaler) — "
+                "presenting pre-upscale backbuffer"
+            );
+            ctx.present(backbuffer, presenter, vsync_duration, state.metadata);
+            ReleaseSemaphore(present_semaphore_, 1, nullptr);
+            this->UpdateStatistics(ctx.queue().statistics, ctx.currentFrameId());
+            return;
+          }
+
           auto mv_view = motion->createView({
               .format = motion_format,
               .type = WMTTextureType2D,
@@ -924,6 +939,16 @@ public:
               .arraySize = 1,
           });
           auto depth_view = MetalFXDepthView(depth, depth_bind_fmt);
+          if (!depth_view) {
+            WARN(
+                "unified-metalfx: depth view missing — temporal encode skipped; "
+                "presenting pre-upscale backbuffer"
+            );
+            ctx.present(backbuffer, presenter, vsync_duration, state.metadata);
+            ReleaseSemaphore(present_semaphore_, 1, nullptr);
+            this->UpdateStatistics(ctx.queue().statistics, ctx.currentFrameId());
+            return;
+          }
           Rc<Texture> exposure;
           WMTFXTemporalScalerProps props{};
           props.input_content_width = content_w;
@@ -943,7 +968,8 @@ public:
               backbuffer, upscaled, depth, depth_view, motion, mv_view, exposure, scaler, props
           );
           const bool can_interp = have_interp && interpolator && interpolator->interpolator() &&
-                                  prev_color && depth && motion && depth_bind_fmt != WMTPixelFormatInvalid;
+                                  prev_color && depth && motion && depth_view &&
+                                  depth_bind_fmt != WMTPixelFormatInvalid;
           if (can_interp) {
             WMTFXFrameInterpolatorProps iprops{};
             iprops.should_reset_history = reset;
@@ -982,7 +1008,9 @@ public:
           WARN(
               "unified-metalfx: pacing rendered=", rendered_present_count_,
               " presented=", presented_present_count_,
-              " interp=", (have_interp ? "on" : "off_waiting_prev")
+              " interp=", (have_interp ? "on" : "off_waiting_prev"),
+              " depth_bind=",
+              (depth_is_estimate ? "ESTIMATE_DEPTH_CONSTANT_FAR" : "real_depth")
           );
         }
       }
@@ -1467,14 +1495,31 @@ private:
   }
 
   /**
+   * DXGI depth formats that become Metal Depth32Float_Stencil8 / R32X8X32 —
+   * unsuitable for MetalFX and must never replace a live R32Float estimate
+   * via EnsurePresentCopyTexture (that destroy/recreate caused crash C).
+   */
+  static bool DxgiDepthUnsuitableForMetalFX(DXGI_FORMAT fmt) {
+    switch (fmt) {
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+    case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+      return true;
+    default:
+      break;
+    }
+    return false;
+  }
+
+  /**
    * MetalFX depth bind view. Storage format must already match the scaler/FI
    * descriptor (R32Float or Depth32Float). Never create cross-format views —
    * D32S8 → Depth32Float is rejected by Metal on this GPU/OS.
    */
   static TextureViewKey MetalFXDepthView(Rc<Texture> &depth, WMTPixelFormat bind_fmt) {
-    if (!depth)
+    if (!depth || bind_fmt == WMTPixelFormatInvalid)
       return TextureViewKey{};
-    (void)bind_fmt;
     return depth->fullView;
   }
 
@@ -1606,6 +1651,10 @@ private:
     const char *depth_prov = present_dm::kDepthMissing;
     const char *motion_prov = present_dm::kMotionUnavailable;
     DXGI_FORMAT depth_fmt = DXGI_FORMAT_UNKNOWN;
+    // Identity of present_depth_ Metal texture before estimate fill — if Fill
+    // reallocates, scaler/FI must reset rather than encode against a new id.
+    Texture *depth_tex_before_estimate =
+        present_depth_ && present_depth_->texture() ? present_depth_->texture().ptr() : nullptr;
 
     Com<ID3D11Resource> depth_src;
     if (present_dm::resolveDepthForPresent(
@@ -1616,13 +1665,23 @@ private:
         t->GetDesc(&ddesc);
         depth_fmt = ddesc.Format;
       }
-      // Inherit source bind flags (depth formats often reject mismatched binds).
-      if (EnsurePresentCopyTexture(present_depth_, depth_src.ptr(), 0)) {
+      // Never copy D32S8 into present_depth_: EnsurePresentCopyTexture would
+      // destroy the live R32Float estimate (format mismatch), then Fill would
+      // allocate a new estimate while scaler/FI stay on depth_fmt=55 without
+      // reset — MetalFX encode then page-faults (live crash C).
+      if (DxgiDepthUnsuitableForMetalFX(depth_fmt)) {
+        WARN(
+            "unified-metalfx: real depth DXGI fmt=", (uint32_t)depth_fmt,
+            " (D32S8/unsuitable) — skip copy; keep/reuse labeled R32Float "
+            "ESTIMATE_DEPTH_CONSTANT_FAR for bind"
+        );
+        depth_prov = present_dm::kDepthMissing;
+        // Leave present_depth_ alone when it is already a reusable R32 estimate.
+      } else if (EnsurePresentCopyTexture(present_depth_, depth_src.ptr(), 0)) {
         device_context_->CopyResource(
             static_cast<ID3D11Resource *>(present_depth_.ptr()), depth_src.ptr()
         );
-        // Stencil-combined / unknown MetalFX depth → labeled R32Float estimate.
-        // Do not invent a Depth32Float view of D32S8 (Metal rejects that cast).
+        // Belt-and-suspenders: Metal format after copy still unsuitable → estimate.
         if (present_depth_ && present_depth_->texture()) {
           WMTPixelFormat src_metal = present_depth_->texture()->pixelFormat();
           if (MetalFXSafeDepthFormat(src_metal) == WMTPixelFormatInvalid) {
@@ -1649,7 +1708,31 @@ private:
         present_depth_ = nullptr;
         depth_prov = present_dm::kDepthEstimateFailed;
         depth_fmt = DXGI_FORMAT_UNKNOWN;
+      } else {
+        Texture *depth_tex_after =
+            present_depth_ && present_depth_->texture() ? present_depth_->texture().ptr() : nullptr;
+        if (depth_tex_after != depth_tex_before_estimate) {
+          // New estimate texture id while scaler/FI may still be live — force reset.
+          temporal_needs_reset_ = true;
+          WARN(
+              "unified-metalfx: estimate depth texture (re)allocated — temporal reset; "
+              "encode_bind=ESTIMATE_DEPTH_CONSTANT_FAR "
+              "provenance_truth=LABELED_ESTIMATE_NOT_ENGINE_TRUTH"
+          );
+        } else if (depth_prov == present_dm::kDepthEstimateConstantFar) {
+          // Reused live estimate — honest encode label for next human boot.
+          if (!estimate_depth_encode_logged_) {
+            WARN(
+                "unified-metalfx: encode_bind=ESTIMATE_DEPTH_CONSTANT_FAR "
+                "(reused R32Float; skipped unsuitable real depth) "
+                "provenance_truth=LABELED_ESTIMATE_NOT_ENGINE_TRUTH"
+            );
+            estimate_depth_encode_logged_ = true;
+          }
+        }
       }
+    } else {
+      estimate_depth_encode_logged_ = false;
     }
 
     Com<ID3D11Resource> motion_src;
@@ -1740,6 +1823,8 @@ private:
   uint32_t temporal_output_width_ = 0;
   uint32_t temporal_output_height_ = 0;
   bool temporal_needs_reset_ = true;
+  /** Once-per-transition WARN that encode reused labeled R32 estimate after D32S8 skip. */
+  bool estimate_depth_encode_logged_ = false;
   bool frame_interpolator_unsupported_logged_ = false;
   uint64_t rendered_present_count_ = 0;
   uint64_t presented_present_count_ = 0;

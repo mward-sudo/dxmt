@@ -1220,6 +1220,19 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     case EncoderType::TemporalUpscale: {
       auto data = static_cast<TemporalUpscaleData *>(current);
 
+      // Never null-deref MetalFX: skip temporal encode if any required handle is missing.
+      if (!data->scaler || !data->scaler->scaler() || !data->input || !data->output || !data->depth ||
+          !data->motion_vector) {
+        WARN("unified-metalfx: TemporalUpscale skipped (nil scaler/texture)");
+        data->fence_update.forEach([&](auto id) {
+          auto blit = cmdbuf.blitCommandEncoder();
+          blit.updateFence(fence_pool_[id]);
+          blit.endEncoding();
+        });
+        data->~TemporalUpscaleData();
+        break;
+      }
+
       auto begin_scaler = cmdbuf.blitCommandEncoder();
       begin_scaler.setLabel(WMT::String::string("BeginScaler", WMTUTF8StringEncoding));
       data->fence_wait.forEach([&](auto id) { begin_scaler.waitForFence(fence_pool_[id]); });
