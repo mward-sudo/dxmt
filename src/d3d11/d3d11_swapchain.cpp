@@ -23,6 +23,7 @@
 #include "wsi_window.hpp"
 #include "dxmt_info.hpp"
 #include "dxmt_presenter.hpp"
+#include "present_depth_motion.hpp"
 #include <atomic>
 #include <cfloat>
 #include <format>
@@ -514,6 +515,14 @@ public:
     backbuffer_->AddRefPrivate();
     backbuffer_->Release();
 
+    // present-dm: reset history on resize
+    present_prev_color_ = nullptr;
+    present_depth_ = nullptr;
+    present_motion_ = nullptr;
+    present_prev_color_valid_ = false;
+    if (present_dm::enabled())
+      EnsurePresentPrevColorTexture();
+
     if constexpr (EnableMetalFX) {
       D3D11_TEXTURE2D_DESC1 upscaled_desc_ = backbuffer_desc_;
       upscaled_desc_.Height *= scale_factor;
@@ -765,6 +774,11 @@ public:
       device_context_->Commit();
       return hr;
     }
+
+    // present-dm: export synchronized color (+prev), optional real depth, motion
+    // provenance — before spatial upscale encode. Does not wire FrameInterpolator.
+    if (present_dm::enabled())
+      ExportPresentDepthMotion();
 
     double vsync_duration =
         std::max(SyncInterval * 1.0 /
@@ -1061,6 +1075,125 @@ private:
     return edr_value.maximum_potential_edr_color_component_value > 1.0f;
   };
 
+  void EnsurePresentPrevColorTexture() {
+    if (present_prev_color_)
+      return;
+    D3D11_TEXTURE2D_DESC1 prev_desc = backbuffer_desc_;
+    prev_desc.Usage = D3D11_USAGE_DEFAULT;
+    prev_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    prev_desc.CPUAccessFlags = 0;
+    prev_desc.MiscFlags = 0;
+    if (FAILED(dxmt::CreateDeviceTexture2D(
+            device_, &prev_desc, nullptr, reinterpret_cast<ID3D11Texture2D1 **>(&present_prev_color_)
+        ))) {
+      WARN("present-dm: failed to allocate previous-color texture");
+      present_prev_color_ = nullptr;
+      return;
+    }
+    present_prev_color_->AddRefPrivate();
+    present_prev_color_->Release();
+  }
+
+  bool EnsurePresentCopyTexture(
+      Com<D3D11ResourceCommon, false> &slot, ID3D11Resource *source, UINT bind_flags
+  ) {
+    if (!source)
+      return false;
+    Com<ID3D11Texture2D> src_tex;
+    if (FAILED(source->QueryInterface(IID_PPV_ARGS(&src_tex))))
+      return false;
+    D3D11_TEXTURE2D_DESC src_desc{};
+    src_tex->GetDesc(&src_desc);
+    if (slot && slot->texture() && slot->texture()->width() == src_desc.Width &&
+        slot->texture()->height() == src_desc.Height) {
+      D3D11_TEXTURE2D_DESC1 existing{};
+      slot->GetDesc1(&existing);
+      if (existing.Format == src_desc.Format)
+        return true;
+    }
+    slot = nullptr;
+    D3D11_TEXTURE2D_DESC1 dst_desc{};
+    dst_desc.Width = src_desc.Width;
+    dst_desc.Height = src_desc.Height;
+    dst_desc.MipLevels = 1;
+    dst_desc.ArraySize = 1;
+    dst_desc.Format = src_desc.Format;
+    dst_desc.SampleDesc = src_desc.SampleDesc;
+    dst_desc.Usage = D3D11_USAGE_DEFAULT;
+    dst_desc.BindFlags = bind_flags ? bind_flags : src_desc.BindFlags;
+    dst_desc.CPUAccessFlags = 0;
+    dst_desc.MiscFlags = 0;
+    if (FAILED(dxmt::CreateDeviceTexture2D(
+            device_, &dst_desc, nullptr, reinterpret_cast<ID3D11Texture2D1 **>(&slot)
+        ))) {
+      WARN("present-dm: failed to allocate Present export texture fmt=", (uint32_t)src_desc.Format);
+      slot = nullptr;
+      return false;
+    }
+    slot->AddRefPrivate();
+    slot->Release();
+    return true;
+  }
+
+  void ExportPresentDepthMotion() {
+    EnsurePresentPrevColorTexture();
+    const bool prev_valid = present_prev_color_valid_ && present_prev_color_;
+    const char *depth_prov = present_dm::kDepthMissing;
+    const char *motion_prov = present_dm::kMotionUnavailable;
+    DXGI_FORMAT depth_fmt = DXGI_FORMAT_UNKNOWN;
+
+    Com<ID3D11Resource> depth_src;
+    if (present_dm::resolveDepthForPresent(
+            device_context_, backbuffer_desc_.Width, backbuffer_desc_.Height, &depth_src, &depth_prov
+        )) {
+      D3D11_TEXTURE2D_DESC ddesc{};
+      if (Com<ID3D11Texture2D> t; SUCCEEDED(depth_src->QueryInterface(IID_PPV_ARGS(&t)))) {
+        t->GetDesc(&ddesc);
+        depth_fmt = ddesc.Format;
+      }
+      // Inherit source bind flags (depth formats often reject mismatched binds).
+      if (EnsurePresentCopyTexture(present_depth_, depth_src.ptr(), 0)) {
+        device_context_->CopyResource(
+            static_cast<ID3D11Resource *>(present_depth_.ptr()), depth_src.ptr()
+        );
+      } else {
+        depth_prov = present_dm::kDepthMissing;
+        present_depth_ = nullptr;
+      }
+    } else {
+      present_depth_ = nullptr;
+    }
+
+    Com<ID3D11Resource> motion_src;
+    if (present_dm::resolveTitleMotion(&motion_src, &motion_prov)) {
+      if (EnsurePresentCopyTexture(present_motion_, motion_src.ptr(), 0)) {
+        device_context_->CopyResource(
+            static_cast<ID3D11Resource *>(present_motion_.ptr()), motion_src.ptr()
+        );
+      } else {
+        motion_prov = present_dm::kMotionUnavailable;
+        present_motion_ = nullptr;
+      }
+    } else {
+      present_motion_ = nullptr;
+      motion_prov = present_dm::kMotionUnavailable;
+    }
+
+    present_dm::logPresentTick(
+        presentation_count_ + 1, backbuffer_desc_.Width, backbuffer_desc_.Height, prev_valid, depth_prov,
+        motion_prov, depth_fmt
+    );
+
+    // Retain current color as previous for the next Present tick (pre-upscale).
+    if (present_prev_color_ && backbuffer_) {
+      device_context_->CopyResource(
+          static_cast<ID3D11Resource *>(present_prev_color_.ptr()),
+          static_cast<ID3D11Resource *>(backbuffer_.ptr())
+      );
+      present_prev_color_valid_ = true;
+    }
+  }
+
   Com<IDXGIFactory1> factory_;
   Com<IMTLDXGIDevice> dxgi_device_;
   WMT::Object native_view_;
@@ -1071,6 +1204,11 @@ private:
   D3D11_TEXTURE2D_DESC1 backbuffer_desc_;
   IMTLD3D11DeviceContext* device_context_;
   Com<D3D11ResourceCommon, false> backbuffer_;
+  /** present-dm export targets (pre-upscale color history + optional depth/MV). */
+  Com<D3D11ResourceCommon, false> present_prev_color_;
+  Com<D3D11ResourceCommon, false> present_depth_;
+  Com<D3D11ResourceCommon, false> present_motion_;
+  bool present_prev_color_valid_ = false;
   HANDLE present_semaphore_;
   std::unique_ptr<CpuFence> frame_latency_fence_;
   HWND hWnd;

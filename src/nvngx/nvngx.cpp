@@ -6,6 +6,7 @@
 #include "nvngx_parameter.hpp"
 #include "../d3d11/d3d11_interfaces.hpp"
 #include "../dxgi/dxgi_interfaces.h"
+#include <atomic>
 #include <cmath>
 
 namespace dxmt {
@@ -85,6 +86,12 @@ NVNGX_API NVNGX_RESULT
 NVSDK_NGX_D3D11_EvaluateFeature(
     ID3D11DeviceContext *context, const unsigned int *handle, NVNGXParameter *params, void *callback
 ) {
+  // present-dm: count EvaluateFeature so Present can prove NGX silence on ETS2 Picture.
+  // Counter lives in this DLL; also WARN so nvngx.log shows any fire.
+  static std::atomic<uint64_t> s_evaluate_count{0};
+  auto n = s_evaluate_count.fetch_add(1) + 1;
+  WARN("present-dm: NVSDK_NGX_D3D11_EvaluateFeature fired (count=", n, ")");
+
   auto parameters = static_cast<ParametersImpl *>(params);
   switch (static_cast<CommonFeature *>((void *)handle)->feature) {
   case NVNGX_FEATURE_SUPERSAMPLING: {

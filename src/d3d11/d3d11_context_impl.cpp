@@ -38,6 +38,7 @@
 #include "dxmt_staging.hpp"
 #include "d3d11_resource.hpp"
 #include "dxmt_texture.hpp"
+#include "present_depth_motion.hpp"
 #include "util_flags.hpp"
 #include "util_math.hpp"
 #include "util_win32_compat.h"
@@ -2876,6 +2877,9 @@ public:
           should_invalidate_pass = true;
           OMResolveSRVHazard(dsv);
         }
+        // present-dm: remember scene depth while bound (often unbound by Present).
+        if (device->GetImmediateContextPrivate() == static_cast<IMTLD3D11DeviceContext *>(this))
+          present_dm::trackSceneDepth(dsv);
       } else {
         if (state_.OutputMerger.DSV) {
           should_invalidate_pass = true;
@@ -5247,6 +5251,9 @@ public:
       return;
     if (pDesc->ExposureTexture && !(exposure = static_cast<D3D11ResourceCommon *>(pDesc->ExposureTexture)->texture()))
       return;
+
+    // present-dm: title/NGX path — real motion becomes available for Present export.
+    present_dm::noteTemporalUpscale(pDesc->Color, pDesc->Depth, pDesc->MotionVector);
 
     WMTPixelFormat motion_vector_format = GetCorrectMotionVectorFormat(motion_vector->pixelFormat());
     if (motion_vector_format == WMTPixelFormatInvalid) {
