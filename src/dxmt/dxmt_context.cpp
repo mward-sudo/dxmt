@@ -1223,7 +1223,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       // Never null-deref MetalFX: skip temporal encode if any required handle is missing.
       if (!data->scaler || !data->scaler->scaler() || !data->input || !data->output || !data->depth ||
           !data->motion_vector) {
-        WARN("unified-metalfx: TemporalUpscale skipped (nil scaler/texture)");
+        WARN("unified-metalfx: TemporalUpscale skipped (nil scaler/color/depth/motion) — no-op encode");
         data->fence_update.forEach([&](auto id) {
           auto blit = cmdbuf.blitCommandEncoder();
           blit.updateFence(fence_pool_[id]);
@@ -1258,7 +1258,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       // Never null-deref MetalFX: skip interp encode if any required handle is missing.
       if (!data->interpolator || !data->interpolator->interpolator() || !data->color || !data->prev_color ||
           !data->depth || !data->motion_vector || !data->output) {
-        WARN("unified-metalfx: FrameInterpolate skipped (nil interpolator/texture)");
+        WARN("unified-metalfx: fi_encode=skip_reason=nil_interpolator_or_texture — no-op encode");
         data->fence_update.forEach([&](auto id) {
           auto blit = cmdbuf.blitCommandEncoder();
           blit.updateFence(fence_pool_[id]);

@@ -12,6 +12,7 @@
 #include "dxmt_presenter.hpp"
 #include "log/log.hpp"
 #include "d3d11_resource.hpp"
+#include <string>
 #include "d3d11_device.hpp"
 #include "util_cpu_fence.hpp"
 #include "util_env.hpp"
@@ -872,8 +873,32 @@ public:
       // Depth must be bindable R32Float/Depth32Float — never encode with Invalid/D32S8.
       const bool encoded = depth_tex && motion_tex && depth_bind_fmt != WMTPixelFormatInvalid &&
                            EnsureTemporalScaler(depth_tex, motion_tex) && interpolated_backbuffer_;
-      const bool have_interp =
-          encoded && prev_valid && EnsureFrameInterpolator(depth_tex, motion_tex);
+      // Hard preempt: FI only after depth identity + scaler/FI unchanged for N>=2 Presents.
+      UpdateMetalFXStabilityStreak(depth_tex, motion_tex);
+      const char *fi_skip = nullptr;
+      bool have_interp = false;
+      if (!encoded) {
+        fi_skip = "skip_reason=temporal_bind_unsafe";
+      } else if (!prev_valid) {
+        fi_skip = "skip_reason=prev_color_missing";
+      } else if (metalfx_stable_present_streak_ < kMetalFXFiStablePresentsRequired) {
+        fi_skip = "skip_reason=awaiting_stable_presents";
+      } else if (estimate_depth_reallocated_this_export_) {
+        fi_skip = "skip_reason=estimate_just_reallocated";
+      } else if (!EnsureFrameInterpolator(depth_tex, motion_tex)) {
+        fi_skip = "skip_reason=fi_unavailable";
+      } else {
+        // Re-check streak after possible FI create (create resets streak to 0).
+        UpdateMetalFXStabilityStreak(depth_tex, motion_tex);
+        if (metalfx_stable_present_streak_ < kMetalFXFiStablePresentsRequired) {
+          fi_skip = "skip_reason=awaiting_stable_presents";
+        } else {
+          have_interp = true;
+          LogFiEncodeStrategy("ok");
+        }
+      }
+      if (!have_interp && fi_skip)
+        LogFiEncodeStrategy(fi_skip);
       if (!encoded) {
         WARN(
             "unified-metalfx: temporal encode skipped (depth=", (bool)depth_tex,
@@ -993,7 +1018,7 @@ public:
           } else {
             if (have_interp) {
               WARN(
-                  "unified-metalfx: interp encode skipped (nil interpolator/texture/depth) — "
+                  "unified-metalfx: fi_encode=skip_reason=nil_interpolator_or_texture — "
                   "temporal upscale Present only"
               );
             }
@@ -1548,11 +1573,15 @@ private:
     const uint32_t in_h = backbuffer_desc_.Height;
     const uint32_t out_w = (uint32_t)(desc_.Width * scale_factor);
     const uint32_t out_h = (uint32_t)(desc_.Height * scale_factor);
+    Texture *depth_id = depth.ptr();
+    Texture *motion_id = motion.ptr();
+    // Sticky to format AND texture identity — id change means recreate (or skip encode).
     if (metalfx_temporal_scaler_ && temporal_depth_format_ == depth_fmt &&
         temporal_motion_format_ == motion_fmt && temporal_color_format_ == color_fmt &&
         temporal_output_format_ == output_fmt && temporal_input_width_ == in_w &&
         temporal_input_height_ == in_h && temporal_output_width_ == out_w &&
-        temporal_output_height_ == out_h) {
+        temporal_output_height_ == out_h && temporal_bound_depth_tex_ == depth_id &&
+        temporal_bound_motion_tex_ == motion_id) {
       return true;
     }
 
@@ -1575,6 +1604,9 @@ private:
     metalfx_temporal_scaler_ = new TemporalScaler(device_->GetMTLDevice(), info);
     if (!metalfx_temporal_scaler_) {
       ERR("unified-metalfx: TemporalScaler create failed");
+      temporal_bound_depth_tex_ = nullptr;
+      temporal_bound_motion_tex_ = nullptr;
+      metalfx_stable_present_streak_ = 0;
       return false;
     }
     temporal_depth_format_ = depth_fmt;
@@ -1585,7 +1617,14 @@ private:
     temporal_input_height_ = in_h;
     temporal_output_width_ = out_w;
     temporal_output_height_ = out_h;
+    temporal_bound_depth_tex_ = depth_id;
+    temporal_bound_motion_tex_ = motion_id;
     temporal_needs_reset_ = true;
+    metalfx_stable_present_streak_ = 0;
+    metalfx_stable_depth_tex_ = nullptr;
+    metalfx_stable_motion_tex_ = nullptr;
+    metalfx_stable_scaler_ = nullptr;
+    metalfx_stable_fi_ = nullptr;
     WARN(
         "unified-metalfx: TemporalScaler created (attachable for FrameInterpolator) "
         "in=", in_w, "x", in_h, " out=", out_w, "x", out_h,
@@ -1611,12 +1650,18 @@ private:
       }
       return false;
     }
-    if (metalfx_frame_interpolator_)
-      return true;
-
     WMTPixelFormat depth_fmt = MetalFXSafeDepthFormat(depth->pixelFormat());
     if (depth_fmt == WMTPixelFormatInvalid)
       return false;
+    Texture *depth_id = depth.ptr();
+    Texture *motion_id = motion.ptr();
+    if (metalfx_frame_interpolator_ && temporal_bound_depth_tex_ == depth_id &&
+        temporal_bound_motion_tex_ == motion_id &&
+        temporal_depth_format_ == depth_fmt) {
+      return true;
+    }
+    // Depth/motion identity drifted under a live FI — drop and recreate.
+    metalfx_frame_interpolator_ = nullptr;
 
     WMTFXFrameInterpolatorInfo info{};
     info.color_format = backbuffer_->texture()->pixelFormat();
@@ -1634,8 +1679,12 @@ private:
     if (!metalfx_frame_interpolator_ || !metalfx_frame_interpolator_->interpolator()) {
       ERR("unified-metalfx: FrameInterpolator create failed (scaler attach)");
       metalfx_frame_interpolator_ = nullptr;
+      metalfx_stable_present_streak_ = 0;
       return false;
     }
+    // New FI object → stability streak restarts (hard preempt N>=2).
+    metalfx_stable_present_streak_ = 0;
+    metalfx_stable_fi_ = nullptr;
     WARN(
         "unified-metalfx: FrameInterpolator created with desc.scaler=TemporalScaler "
         "(colocation: upscale→interp→Presenter) in=", info.input_width, "x", info.input_height,
@@ -1645,18 +1694,104 @@ private:
     return true;
   }
 
+  /** Owned R32 estimate depth reusable for MetalFX bind (size matches backbuffer). */
+  bool IsReusableEstimateDepthSlot(const Com<D3D11ResourceCommon, false> &slot) const {
+    if (!slot || !slot->texture())
+      return false;
+    if (slot->texture()->width() != backbuffer_desc_.Width ||
+        slot->texture()->height() != backbuffer_desc_.Height)
+      return false;
+    D3D11_TEXTURE2D_DESC1 existing{};
+    const_cast<Com<D3D11ResourceCommon, false> &>(slot)->GetDesc1(&existing);
+    return existing.Format == DXGI_FORMAT_R32_FLOAT &&
+           MetalFXSafeDepthFormat(slot->texture()->pixelFormat()) == WMTPixelFormatR32Float;
+  }
+
+  /** Invalidate FI + force temporal history reset when depth/motion identity changes. */
+  void OnMetalFXDepthOrMotionIdentityChanged(const char *reason) {
+    temporal_needs_reset_ = true;
+    metalfx_stable_present_streak_ = 0;
+    metalfx_stable_depth_tex_ = nullptr;
+    metalfx_stable_motion_tex_ = nullptr;
+    metalfx_stable_scaler_ = nullptr;
+    metalfx_stable_fi_ = nullptr;
+    // Force scaler recreate on next Ensure — format may match but texture id changed.
+    temporal_bound_depth_tex_ = nullptr;
+    temporal_bound_motion_tex_ = nullptr;
+    if constexpr (kTemporal) {
+      metalfx_frame_interpolator_ = nullptr;
+      LogFiEncodeStrategy(std::string("skip_reason=identity_changed:") + reason);
+    }
+  }
+
+  void UpdateMetalFXStabilityStreak(const Rc<Texture> &depth, const Rc<Texture> &motion) {
+    if constexpr (!kTemporal)
+      return;
+    Texture *depth_id = depth ? depth.ptr() : nullptr;
+    Texture *motion_id = motion ? motion.ptr() : nullptr;
+    void *scaler_id = metalfx_temporal_scaler_ ? (void *)metalfx_temporal_scaler_.ptr() : nullptr;
+    void *fi_id = metalfx_frame_interpolator_ ? (void *)metalfx_frame_interpolator_.ptr() : nullptr;
+    const bool same =
+        depth_id && motion_id && scaler_id && depth_id == metalfx_stable_depth_tex_ &&
+        motion_id == metalfx_stable_motion_tex_ && scaler_id == metalfx_stable_scaler_ &&
+        fi_id == metalfx_stable_fi_ && !estimate_depth_reallocated_this_export_ &&
+        !temporal_needs_reset_;
+    if (same) {
+      if (metalfx_stable_present_streak_ < 0xffffu)
+        metalfx_stable_present_streak_++;
+    } else {
+      metalfx_stable_present_streak_ = (depth_id && motion_id && scaler_id) ? 1u : 0u;
+      metalfx_stable_depth_tex_ = depth_id;
+      metalfx_stable_motion_tex_ = motion_id;
+      metalfx_stable_scaler_ = scaler_id;
+      metalfx_stable_fi_ = fi_id;
+    }
+  }
+
+  void LogEncodeBindStrategy(const char *bind) {
+    if (!bind)
+      return;
+    if (last_encode_bind_log_ == bind)
+      return;
+    last_encode_bind_log_ = bind;
+    WARN(
+        "unified-metalfx: encode_bind=", bind,
+        " provenance_truth=",
+        (std::string(bind) == "ESTIMATE_DEPTH_CONSTANT_FAR"
+             ? "LABELED_ESTIMATE_NOT_ENGINE_TRUTH"
+             : "REAL_DEPTH_TRACKED")
+    );
+  }
+
+  void LogFiEncodeStrategy(const std::string &tag) {
+    if (last_fi_encode_log_ == tag)
+      return;
+    last_fi_encode_log_ = tag;
+    WARN("unified-metalfx: fi_encode=", tag.c_str());
+  }
+
+  void LogFiEncodeStrategy(const char *tag) {
+    if (!tag)
+      return;
+    LogFiEncodeStrategy(std::string(tag));
+  }
+
   void ExportPresentDepthMotion(const char *encode_label) {
     EnsurePresentPrevColorTexture();
     const bool prev_valid = present_prev_color_valid_ && present_prev_color_;
     const char *depth_prov = present_dm::kDepthMissing;
     const char *motion_prov = present_dm::kMotionUnavailable;
     DXGI_FORMAT depth_fmt = DXGI_FORMAT_UNKNOWN;
+    estimate_depth_reallocated_this_export_ = false;
     // Identity of present_depth_ Metal texture before estimate fill — if Fill
     // reallocates, scaler/FI must reset rather than encode against a new id.
     Texture *depth_tex_before_estimate =
         present_depth_ && present_depth_->texture() ? present_depth_->texture().ptr() : nullptr;
+    Texture *motion_tex_before =
+        present_motion_ && present_motion_->texture() ? present_motion_->texture().ptr() : nullptr;
 
     Com<ID3D11Resource> depth_src;
+    bool need_estimate_depth = true;
     if (present_dm::resolveDepthForPresent(
             device_context_, backbuffer_desc_.Width, backbuffer_desc_.Height, &depth_src, &depth_prov
         )) {
@@ -1668,7 +1803,7 @@ private:
       // Never copy D32S8 into present_depth_: EnsurePresentCopyTexture would
       // destroy the live R32Float estimate (format mismatch), then Fill would
       // allocate a new estimate while scaler/FI stay on depth_fmt=55 without
-      // reset — MetalFX encode then page-faults (live crash C).
+      // reset — MetalFX encode then page-faults (live crash C / D).
       if (DxgiDepthUnsuitableForMetalFX(depth_fmt)) {
         WARN(
             "unified-metalfx: real depth DXGI fmt=", (uint32_t)depth_fmt,
@@ -1676,6 +1811,7 @@ private:
             "ESTIMATE_DEPTH_CONSTANT_FAR for bind"
         );
         depth_prov = present_dm::kDepthMissing;
+        need_estimate_depth = true;
         // Leave present_depth_ alone when it is already a reusable R32 estimate.
       } else if (EnsurePresentCopyTexture(present_depth_, depth_src.ptr(), 0)) {
         device_context_->CopyResource(
@@ -1690,20 +1826,30 @@ private:
                 " (D32S8/unsuitable) — no castable MetalFX view; "
                 "labeled R32Float ESTIMATE_DEPTH_CONSTANT_FAR for bind"
             );
-            present_depth_ = nullptr;
+            // Do not destroy a live R32 estimate if copy somehow left D32S8 —
+            // only clear when the slot itself is unsuitable.
+            if (!IsReusableEstimateDepthSlot(present_depth_))
+              present_depth_ = nullptr;
             depth_prov = present_dm::kDepthMissing;
+            need_estimate_depth = true;
+          } else {
+            need_estimate_depth = false;
           }
         }
       } else {
         depth_prov = present_dm::kDepthMissing;
-        present_depth_ = nullptr;
+        need_estimate_depth = true;
+        // Keep live estimate infrastructure — do not null present_depth_.
       }
     } else {
-      present_depth_ = nullptr;
+      depth_prov = present_dm::kDepthMissing;
+      need_estimate_depth = true;
+      // REAL_DEPTH_MISSING: keep owned R32 estimate; never destroy it each Present
+      // (that realloc churn reset temporal history and crashed FI — crash D).
     }
 
     // Real depth missing / unsuitable → labeled constant-far estimate (only after real failure).
-    if (!present_depth_ || depth_prov == present_dm::kDepthMissing) {
+    if (need_estimate_depth || !present_depth_) {
       if (!FillLabeledDepthEstimateConstantFar(&depth_prov, &depth_fmt)) {
         present_depth_ = nullptr;
         depth_prov = present_dm::kDepthEstimateFailed;
@@ -1712,50 +1858,61 @@ private:
         Texture *depth_tex_after =
             present_depth_ && present_depth_->texture() ? present_depth_->texture().ptr() : nullptr;
         if (depth_tex_after != depth_tex_before_estimate) {
-          // New estimate texture id while scaler/FI may still be live — force reset.
-          temporal_needs_reset_ = true;
+          // New estimate texture id while scaler/FI may still be live — invalidate.
+          estimate_depth_reallocated_this_export_ = true;
+          OnMetalFXDepthOrMotionIdentityChanged("estimate_depth_realloc");
           WARN(
               "unified-metalfx: estimate depth texture (re)allocated — temporal reset; "
               "encode_bind=ESTIMATE_DEPTH_CONSTANT_FAR "
               "provenance_truth=LABELED_ESTIMATE_NOT_ENGINE_TRUTH"
           );
+          LogEncodeBindStrategy("ESTIMATE_DEPTH_CONSTANT_FAR");
         } else if (depth_prov == present_dm::kDepthEstimateConstantFar) {
-          // Reused live estimate — honest encode label for next human boot.
-          if (!estimate_depth_encode_logged_) {
-            WARN(
-                "unified-metalfx: encode_bind=ESTIMATE_DEPTH_CONSTANT_FAR "
-                "(reused R32Float; skipped unsuitable real depth) "
-                "provenance_truth=LABELED_ESTIMATE_NOT_ENGINE_TRUTH"
-            );
-            estimate_depth_encode_logged_ = true;
-          }
+          LogEncodeBindStrategy("ESTIMATE_DEPTH_CONSTANT_FAR");
         }
       }
     } else {
-      estimate_depth_encode_logged_ = false;
+      LogEncodeBindStrategy("real_depth");
+    }
+
+    // If suitable real depth replaced the estimate slot, identity may have changed.
+    Texture *depth_tex_now =
+        present_depth_ && present_depth_->texture() ? present_depth_->texture().ptr() : nullptr;
+    if (depth_tex_now != depth_tex_before_estimate && !estimate_depth_reallocated_this_export_) {
+      OnMetalFXDepthOrMotionIdentityChanged("depth_tex_id_change");
     }
 
     Com<ID3D11Resource> motion_src;
+    bool need_estimate_motion = true;
     if (present_dm::resolveTitleMotion(&motion_src, &motion_prov)) {
       if (EnsurePresentCopyTexture(present_motion_, motion_src.ptr(), 0)) {
         device_context_->CopyResource(
             static_cast<ID3D11Resource *>(present_motion_.ptr()), motion_src.ptr()
         );
+        need_estimate_motion = false;
       } else {
         motion_prov = present_dm::kMotionUnavailable;
-        present_motion_ = nullptr;
+        need_estimate_motion = true;
+        // Keep live motion estimate — do not null.
       }
     } else {
-      present_motion_ = nullptr;
       motion_prov = present_dm::kMotionUnavailable;
+      need_estimate_motion = true;
+      // Keep owned zero-MV estimate across REAL_MOTION_UNAVAILABLE presents.
     }
 
     // Real motion unavailable → labeled zero-MV estimate (only after real failure).
-    if (!present_motion_ || motion_prov == present_dm::kMotionUnavailable) {
+    if (need_estimate_motion || !present_motion_) {
       if (!FillLabeledMotionEstimateZero(&motion_prov)) {
         present_motion_ = nullptr;
         motion_prov = present_dm::kMotionEstimateFailed;
       }
+    }
+
+    Texture *motion_tex_now =
+        present_motion_ && present_motion_->texture() ? present_motion_->texture().ptr() : nullptr;
+    if (motion_tex_now != motion_tex_before) {
+      OnMetalFXDepthOrMotionIdentityChanged("motion_tex_id_change");
     }
 
     present_dm::logPresentTick(
@@ -1823,8 +1980,19 @@ private:
   uint32_t temporal_output_width_ = 0;
   uint32_t temporal_output_height_ = 0;
   bool temporal_needs_reset_ = true;
-  /** Once-per-transition WARN that encode reused labeled R32 estimate after D32S8 skip. */
-  bool estimate_depth_encode_logged_ = false;
+  /** Texture identities currently bound into TemporalScaler / FI descriptors. */
+  Texture *temporal_bound_depth_tex_ = nullptr;
+  Texture *temporal_bound_motion_tex_ = nullptr;
+  /** Hard preempt: FI encode only after N stable Presents (depth+scaler+FI unchanged). */
+  static constexpr uint32_t kMetalFXFiStablePresentsRequired = 2u;
+  uint32_t metalfx_stable_present_streak_ = 0;
+  Texture *metalfx_stable_depth_tex_ = nullptr;
+  Texture *metalfx_stable_motion_tex_ = nullptr;
+  void *metalfx_stable_scaler_ = nullptr;
+  void *metalfx_stable_fi_ = nullptr;
+  bool estimate_depth_reallocated_this_export_ = false;
+  std::string last_encode_bind_log_;
+  std::string last_fi_encode_log_;
   bool frame_interpolator_unsupported_logged_ = false;
   uint64_t rendered_present_count_ = 0;
   uint64_t presented_present_count_ = 0;
