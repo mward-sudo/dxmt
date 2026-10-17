@@ -682,14 +682,15 @@ public:
   void upscale(Rc<Texture> &texture, Rc<Texture> &upscaled, Rc<SpatialScaler> &scaler);
 
   void upscaleTemporal(
-      Rc<Texture> &input, Rc<Texture> &output, Rc<Texture> &depth, Rc<Texture> &motion_vector, TextureViewKey mvViewId,
-      Rc<Texture> &exposure, Rc<TemporalScaler> &scaler, const WMTFXTemporalScalerProps &props
+      Rc<Texture> &input, Rc<Texture> &output, Rc<Texture> &depth, TextureViewKey depthViewId,
+      Rc<Texture> &motion_vector, TextureViewKey mvViewId, Rc<Texture> &exposure, Rc<TemporalScaler> &scaler,
+      const WMTFXTemporalScalerProps &props
   );
 
   void interpolateFrame(
-      Rc<Texture> &color, Rc<Texture> &prev_color, Rc<Texture> &depth, Rc<Texture> &motion_vector,
-      TextureViewKey mvViewId, Rc<Texture> &output, Rc<FrameInterpolator> &interpolator,
-      const WMTFXFrameInterpolatorProps &props
+      Rc<Texture> &color, Rc<Texture> &prev_color, Rc<Texture> &depth, TextureViewKey depthViewId,
+      Rc<Texture> &motion_vector, TextureViewKey mvViewId, Rc<Texture> &output,
+      Rc<FrameInterpolator> &interpolator, const WMTFXFrameInterpolatorProps &props
   );
 
   void signalEvent(uint64_t value);

@@ -564,8 +564,9 @@ ArgumentEncodingContext::upscale(Rc<Texture> &texture, Rc<Texture> &upscaled, Rc
 
 void
 ArgumentEncodingContext::upscaleTemporal(
-    Rc<Texture> &input, Rc<Texture> &output, Rc<Texture> &depth, Rc<Texture> &motion_vector, TextureViewKey mvViewId,
-    Rc<Texture> &exposure, Rc<TemporalScaler> &scaler, const WMTFXTemporalScalerProps &props
+    Rc<Texture> &input, Rc<Texture> &output, Rc<Texture> &depth, TextureViewKey depthViewId,
+    Rc<Texture> &motion_vector, TextureViewKey mvViewId, Rc<Texture> &exposure, Rc<TemporalScaler> &scaler,
+    const WMTFXTemporalScalerProps &props
 ) {
   assert(!encoder_current);
   auto encoder_info = allocate<TemporalUpscaleData>();
@@ -578,7 +579,7 @@ ArgumentEncodingContext::upscaleTemporal(
 
   encoder_current = encoder_info;
   encoder_info->input = access(input, input->fullView, ResourceAccess::Read).texture;
-  encoder_info->depth = access(depth, depth->fullView, ResourceAccess::Read).texture;
+  encoder_info->depth = access(depth, depthViewId, ResourceAccess::Read).texture;
   encoder_info->motion_vector = access(motion_vector, mvViewId, ResourceAccess::Read).texture;
   encoder_info->output = access(output, output->fullView, ResourceAccess::Write).texture;
   if (exposure) {
@@ -589,9 +590,9 @@ ArgumentEncodingContext::upscaleTemporal(
 
 void
 ArgumentEncodingContext::interpolateFrame(
-    Rc<Texture> &color, Rc<Texture> &prev_color, Rc<Texture> &depth, Rc<Texture> &motion_vector,
-    TextureViewKey mvViewId, Rc<Texture> &output, Rc<FrameInterpolator> &interpolator,
-    const WMTFXFrameInterpolatorProps &props
+    Rc<Texture> &color, Rc<Texture> &prev_color, Rc<Texture> &depth, TextureViewKey depthViewId,
+    Rc<Texture> &motion_vector, TextureViewKey mvViewId, Rc<Texture> &output,
+    Rc<FrameInterpolator> &interpolator, const WMTFXFrameInterpolatorProps &props
 ) {
   assert(!encoder_current);
   auto encoder_info = allocate<FrameInterpolateData>();
@@ -605,7 +606,7 @@ ArgumentEncodingContext::interpolateFrame(
   encoder_current = encoder_info;
   encoder_info->color = access(color, color->fullView, ResourceAccess::Read).texture;
   encoder_info->prev_color = access(prev_color, prev_color->fullView, ResourceAccess::Read).texture;
-  encoder_info->depth = access(depth, depth->fullView, ResourceAccess::Read).texture;
+  encoder_info->depth = access(depth, depthViewId, ResourceAccess::Read).texture;
   encoder_info->motion_vector = access(motion_vector, mvViewId, ResourceAccess::Read).texture;
   encoder_info->output = access(output, output->fullView, ResourceAccess::Write).texture;
   endPass();
@@ -1240,6 +1241,19 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     }
     case EncoderType::FrameInterpolate: {
       auto data = static_cast<FrameInterpolateData *>(current);
+
+      // Never null-deref MetalFX: skip interp encode if any required handle is missing.
+      if (!data->interpolator || !data->interpolator->interpolator() || !data->color || !data->prev_color ||
+          !data->depth || !data->motion_vector || !data->output) {
+        WARN("unified-metalfx: FrameInterpolate skipped (nil interpolator/texture)");
+        data->fence_update.forEach([&](auto id) {
+          auto blit = cmdbuf.blitCommandEncoder();
+          blit.updateFence(fence_pool_[id]);
+          blit.endEncoding();
+        });
+        data->~FrameInterpolateData();
+        break;
+      }
 
       auto begin_interp = cmdbuf.blitCommandEncoder();
       begin_interp.setLabel(WMT::String::string("BeginFrameInterpolate", WMTUTF8StringEncoding));

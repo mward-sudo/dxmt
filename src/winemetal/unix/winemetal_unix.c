@@ -1481,13 +1481,25 @@ _MTLCommandBuffer_encodeTemporalScale(void *obj) {
   struct unixcall_mtlcommandbuffer_temporal_scale *params = obj;
   id<MTLCommandBuffer> cmdbuf = (id<MTLCommandBuffer>)params->cmdbuf;
   id<MTLFXTemporalScaler> scaler = (id<MTLFXTemporalScaler>)params->scaler;
-  scaler.colorTexture = (id<MTLTexture>)params->color;
-  scaler.outputTexture = (id<MTLTexture>)params->output;
-  scaler.depthTexture = (id<MTLTexture>)params->depth;
-  scaler.motionTexture = (id<MTLTexture>)params->motion;
+  id<MTLTexture> color = (id<MTLTexture>)params->color;
+  id<MTLTexture> output = (id<MTLTexture>)params->output;
+  id<MTLTexture> depth = (id<MTLTexture>)params->depth;
+  id<MTLTexture> motion = (id<MTLTexture>)params->motion;
+  if (!cmdbuf || !scaler || !color || !output || !depth || !motion) {
+    fprintf(stderr, "winemetal: encodeTemporalScale skipped (nil scaler/texture)\n");
+    return STATUS_SUCCESS;
+  }
+  scaler.colorTexture = color;
+  scaler.outputTexture = output;
+  scaler.depthTexture = depth;
+  scaler.motionTexture = motion;
   scaler.exposureTexture = (id<MTLTexture>)params->exposure;
   scaler.fence = (id<MTLFence>)params->fence;
   const struct WMTFXTemporalScalerProps *props = params->props.ptr;
+  if (!props) {
+    fprintf(stderr, "winemetal: encodeTemporalScale skipped (nil props)\n");
+    return STATUS_SUCCESS;
+  }
   scaler.inputContentWidth = props->input_content_width;
   scaler.inputContentHeight = props->input_content_height;
   scaler.reset = props->reset;
@@ -1553,15 +1565,29 @@ _MTLCommandBuffer_encodeFrameInterpolate(void *obj) {
   if (@available(macOS 26.0, *)) {
     id<MTLCommandBuffer> cmdbuf = (id<MTLCommandBuffer>)params->cmdbuf;
     id<MTLFXFrameInterpolator> interpolator = (id<MTLFXFrameInterpolator>)params->interpolator;
-    interpolator.colorTexture = (id<MTLTexture>)params->color;
-    interpolator.prevColorTexture = (id<MTLTexture>)params->prev_color;
-    interpolator.depthTexture = (id<MTLTexture>)params->depth;
-    interpolator.motionTexture = (id<MTLTexture>)params->motion;
-    interpolator.outputTexture = (id<MTLTexture>)params->output;
+    id<MTLTexture> color = (id<MTLTexture>)params->color;
+    id<MTLTexture> prev_color = (id<MTLTexture>)params->prev_color;
+    id<MTLTexture> depth = (id<MTLTexture>)params->depth;
+    id<MTLTexture> motion = (id<MTLTexture>)params->motion;
+    id<MTLTexture> output = (id<MTLTexture>)params->output;
+    /* Never crash the process on a nil MetalFX encode — PE skips interp instead. */
+    if (!cmdbuf || !interpolator || !color || !prev_color || !depth || !motion || !output) {
+      fprintf(stderr, "winemetal: encodeFrameInterpolate skipped (nil interpolator/texture)\n");
+      return STATUS_SUCCESS;
+    }
+    interpolator.colorTexture = color;
+    interpolator.prevColorTexture = prev_color;
+    interpolator.depthTexture = depth;
+    interpolator.motionTexture = motion;
+    interpolator.outputTexture = output;
     if (params->ui)
       interpolator.uiTexture = (id<MTLTexture>)params->ui;
     interpolator.fence = (id<MTLFence>)params->fence;
     const struct WMTFXFrameInterpolatorProps *props = params->props.ptr;
+    if (!props) {
+      fprintf(stderr, "winemetal: encodeFrameInterpolate skipped (nil props)\n");
+      return STATUS_SUCCESS;
+    }
     interpolator.shouldResetHistory = props->should_reset_history;
     interpolator.depthReversed = props->depth_reversed;
     interpolator.motionVectorScaleX = props->motion_vector_scale_x;

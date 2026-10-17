@@ -5374,9 +5374,13 @@ public:
         WMTFXTemporalScalerProps new_props = props;
         new_props.motion_vector_scale_x = 1.0;
         new_props.motion_vector_scale_y = 1.0;
-        enc.upscaleTemporal(input, output, depth, mv_downscaled, mv_downscaled->fullView, exposure, scaler, new_props);
+        enc.upscaleTemporal(
+            input, output, depth, depth->fullView, mv_downscaled, mv_downscaled->fullView, exposure, scaler, new_props
+        );
       } else {
-        enc.upscaleTemporal(input, output, depth, motion_vector, mv_view, exposure, scaler, props);
+        enc.upscaleTemporal(
+            input, output, depth, depth->fullView, motion_vector, mv_view, exposure, scaler, props
+        );
       }
     });
   }
