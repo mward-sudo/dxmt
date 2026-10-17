@@ -1445,10 +1445,10 @@ private:
   }
 
   /**
-   * MetalFX temporal/FI descriptors must not use stencil-combined depth
-   * (Depth32Float_Stencil8). Prefer R32Float / Depth32Float; map D32S8 →
-   * Depth32Float for a depth-plane view. Invalid → caller falls back to
-   * labeled R32Float estimate.
+   * MetalFX temporal/FI descriptors accept R32Float / Depth32Float only.
+   * Depth32Float_Stencil8 (and R32X8X32) cannot be rebound as Depth32Float
+   * texture views on this GPU/OS (Metal rejects the cast). Invalid → caller
+   * falls back to labeled R32Float constant-far estimate (honest ESTIMATE_*).
    */
   static WMTPixelFormat MetalFXSafeDepthFormat(WMTPixelFormat src) {
     switch (src) {
@@ -1458,26 +1458,24 @@ private:
       return WMTPixelFormatDepth32Float;
     case WMTPixelFormatDepth32Float_Stencil8:
     case WMTPixelFormatR32X8X32:
-      return WMTPixelFormatDepth32Float;
+      // Do not remap to Depth32Float — view creation asserts.
+      return WMTPixelFormatInvalid;
     default:
       break;
     }
     return WMTPixelFormatInvalid;
   }
 
+  /**
+   * MetalFX depth bind view. Storage format must already match the scaler/FI
+   * descriptor (R32Float or Depth32Float). Never create cross-format views —
+   * D32S8 → Depth32Float is rejected by Metal on this GPU/OS.
+   */
   static TextureViewKey MetalFXDepthView(Rc<Texture> &depth, WMTPixelFormat bind_fmt) {
-    if (!depth || bind_fmt == WMTPixelFormatInvalid)
-      return depth ? depth->fullView : TextureViewKey{};
-    if (depth->pixelFormat() == bind_fmt)
-      return depth->fullView;
-    return depth->createView({
-        .format = bind_fmt,
-        .type = WMTTextureType2D,
-        .firstMiplevel = 0,
-        .miplevelCount = 1,
-        .firstArraySlice = 0,
-        .arraySize = 1,
-    });
+    if (!depth)
+      return TextureViewKey{};
+    (void)bind_fmt;
+    return depth->fullView;
   }
 
   /** Create / refresh attachable MTLFXTemporalScaler for Present (ticket 02). */
@@ -1495,7 +1493,7 @@ private:
     if (depth_fmt == WMTPixelFormatInvalid) {
       ERR(
           "unified-metalfx: depth format ", (uint32_t)depth->pixelFormat(),
-          " unsuitable for MetalFX (need R32Float/Depth32Float or D32S8 view)"
+          " unsuitable for MetalFX (need R32Float/Depth32Float; D32S8 has no castable view)"
       );
       return false;
     }
@@ -1623,14 +1621,15 @@ private:
         device_context_->CopyResource(
             static_cast<ID3D11Resource *>(present_depth_.ptr()), depth_src.ptr()
         );
-        // Stencil-combined / unknown MetalFX depth → keep provenance honest by
-        // falling back to labeled R32Float estimate rather than binding raw DSV.
+        // Stencil-combined / unknown MetalFX depth → labeled R32Float estimate.
+        // Do not invent a Depth32Float view of D32S8 (Metal rejects that cast).
         if (present_depth_ && present_depth_->texture()) {
           WMTPixelFormat src_metal = present_depth_->texture()->pixelFormat();
           if (MetalFXSafeDepthFormat(src_metal) == WMTPixelFormatInvalid) {
             WARN(
                 "unified-metalfx: real depth Metal fmt=", (uint32_t)src_metal,
-                " unsuitable for MetalFX — labeled R32Float estimate for bind"
+                " (D32S8/unsuitable) — no castable MetalFX view; "
+                "labeled R32Float ESTIMATE_DEPTH_CONSTANT_FAR for bind"
             );
             present_depth_ = nullptr;
             depth_prov = present_dm::kDepthMissing;
