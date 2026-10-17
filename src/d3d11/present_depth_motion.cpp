@@ -168,6 +168,16 @@ resolveTitleMotion(ID3D11Resource **out_motion, const char **out_provenance) {
   return true;
 }
 
+bool
+isLabeledEstimate(const char *provenance) {
+  if (!provenance)
+    return false;
+  // ESTIMATE_* labels are fork-synthesized; never engine / title truth.
+  return provenance[0] == 'E' && provenance[1] == 'S' && provenance[2] == 'T' &&
+         provenance[3] == 'I' && provenance[4] == 'M' && provenance[5] == 'A' &&
+         provenance[6] == 'T' && provenance[7] == 'E' && provenance[8] == '_';
+}
+
 void
 logPresentTick(
     uint64_t presentation_count, UINT color_w, UINT color_h, bool prev_color_valid,
@@ -176,11 +186,16 @@ logPresentTick(
   if (presentation_count > 3 && (presentation_count % 300) != 0)
     return;
   auto temporal = temporalUpscaleCount();
+  const bool depth_est = isLabeledEstimate(depth_provenance);
+  const bool motion_est = isLabeledEstimate(motion_provenance);
+  const char *truth =
+      (depth_est || motion_est) ? "LABELED_ESTIMATE_NOT_ENGINE_TRUTH" : "real_or_missing";
   WARN(
       "present-dm: Present#", presentation_count, " color=", color_w, "x", color_h,
       " prev_color=", prevValidLabel(prev_color_valid),
       " current_color=REAL_COLOR_CURRENT", " depth=", depth_provenance,
       " depth_fmt=", (uint32_t)depth_format, " motion=", motion_provenance,
+      " provenance_truth=", truth,
       " temporal_upscale_count=", temporal,
       " title_temporal_silent=", (temporal == 0) ? "yes" : "no",
       " spatial_encode=color_only",

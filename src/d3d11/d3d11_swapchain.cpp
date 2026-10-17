@@ -1135,6 +1135,111 @@ private:
     return true;
   }
 
+  /** Allocate / reuse color-sized texture for labeled estimates; bind as RT+SRV. */
+  bool EnsurePresentEstimateTexture(
+      Com<D3D11ResourceCommon, false> &slot, DXGI_FORMAT format, UINT width, UINT height
+  ) {
+    if (width == 0 || height == 0)
+      return false;
+    if (slot && slot->texture() && slot->texture()->width() == width &&
+        slot->texture()->height() == height) {
+      D3D11_TEXTURE2D_DESC1 existing{};
+      slot->GetDesc1(&existing);
+      if (existing.Format == format)
+        return true;
+    }
+    slot = nullptr;
+    D3D11_TEXTURE2D_DESC1 desc{};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    desc.CPUAccessFlags = 0;
+    desc.MiscFlags = 0;
+    if (FAILED(dxmt::CreateDeviceTexture2D(
+            device_, &desc, nullptr, reinterpret_cast<ID3D11Texture2D1 **>(&slot)
+        ))) {
+      WARN(
+          "present-dm: failed to allocate labeled-estimate texture fmt=", (uint32_t)format,
+          " ", width, "x", height
+      );
+      slot = nullptr;
+      return false;
+    }
+    slot->AddRefPrivate();
+    slot->Release();
+    return true;
+  }
+
+  bool ClearPresentEstimateTexture(ID3D11Resource *resource, const FLOAT rgba[4]) {
+    if (!resource || !device_ || !device_context_)
+      return false;
+    Com<ID3D11RenderTargetView> rtv;
+    if (FAILED(device_->CreateRenderTargetView(resource, nullptr, &rtv))) {
+      WARN("present-dm: failed to create RTV for labeled-estimate clear");
+      return false;
+    }
+    device_context_->ClearRenderTargetView(rtv.ptr(), rgba);
+    return true;
+  }
+
+  /**
+   * Labeled motion estimate after REAL_MOTION_UNAVAILABLE: zero RG16Float MVs
+   * (screen-space displacement assumed static). Explicitly not engine truth.
+   */
+  bool FillLabeledMotionEstimateZero(const char **out_provenance) {
+    if (!out_provenance)
+      return false;
+    *out_provenance = present_dm::kMotionEstimateFailed;
+    if (!EnsurePresentEstimateTexture(
+            present_motion_, DXGI_FORMAT_R16G16_FLOAT, backbuffer_desc_.Width,
+            backbuffer_desc_.Height
+        ))
+      return false;
+    const FLOAT zeros[4] = {0.f, 0.f, 0.f, 0.f};
+    if (!ClearPresentEstimateTexture(
+            static_cast<ID3D11Resource *>(present_motion_.ptr()), zeros
+        )) {
+      present_motion_ = nullptr;
+      return false;
+    }
+    *out_provenance = present_dm::kMotionEstimateZero;
+    return true;
+  }
+
+  /**
+   * Labeled depth estimate only when real depth is missing: constant far (1.0)
+   * R32Float. Explicitly not engine truth / reversed-Z aware.
+   */
+  bool FillLabeledDepthEstimateConstantFar(const char **out_provenance, DXGI_FORMAT *out_fmt) {
+    if (!out_provenance)
+      return false;
+    *out_provenance = present_dm::kDepthEstimateFailed;
+    if (out_fmt)
+      *out_fmt = DXGI_FORMAT_UNKNOWN;
+    if (!EnsurePresentEstimateTexture(
+            present_depth_, DXGI_FORMAT_R32_FLOAT, backbuffer_desc_.Width, backbuffer_desc_.Height
+        ))
+      return false;
+    // Normalized far plane for conventional depth; estimate only — not reversed-Z truth.
+    const FLOAT far_plane[4] = {1.f, 1.f, 1.f, 1.f};
+    if (!ClearPresentEstimateTexture(
+            static_cast<ID3D11Resource *>(present_depth_.ptr()), far_plane
+        )) {
+      present_depth_ = nullptr;
+      return false;
+    }
+    *out_provenance = present_dm::kDepthEstimateConstantFar;
+    if (out_fmt)
+      *out_fmt = DXGI_FORMAT_R32_FLOAT;
+    return true;
+  }
+
   void ExportPresentDepthMotion() {
     EnsurePresentPrevColorTexture();
     const bool prev_valid = present_prev_color_valid_ && present_prev_color_;
@@ -1164,6 +1269,15 @@ private:
       present_depth_ = nullptr;
     }
 
+    // Real depth missing → labeled constant-far estimate (only after real failure).
+    if (!present_depth_ || depth_prov == present_dm::kDepthMissing) {
+      if (!FillLabeledDepthEstimateConstantFar(&depth_prov, &depth_fmt)) {
+        present_depth_ = nullptr;
+        depth_prov = present_dm::kDepthEstimateFailed;
+        depth_fmt = DXGI_FORMAT_UNKNOWN;
+      }
+    }
+
     Com<ID3D11Resource> motion_src;
     if (present_dm::resolveTitleMotion(&motion_src, &motion_prov)) {
       if (EnsurePresentCopyTexture(present_motion_, motion_src.ptr(), 0)) {
@@ -1177,6 +1291,14 @@ private:
     } else {
       present_motion_ = nullptr;
       motion_prov = present_dm::kMotionUnavailable;
+    }
+
+    // Real motion unavailable → labeled zero-MV estimate (only after real failure).
+    if (!present_motion_ || motion_prov == present_dm::kMotionUnavailable) {
+      if (!FillLabeledMotionEstimateZero(&motion_prov)) {
+        present_motion_ = nullptr;
+        motion_prov = present_dm::kMotionEstimateFailed;
+      }
     }
 
     present_dm::logPresentTick(
