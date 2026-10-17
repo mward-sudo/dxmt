@@ -597,6 +597,10 @@ class FXSpatialScaler : public Object {
 public:
 };
 
+class FXFrameInterpolator : public Object {
+public:
+};
+
 class LogContainer : public Object {
 public:
   std::vector<Object>
@@ -720,6 +724,16 @@ public:
       Fence fence, const WMTFXTemporalScalerProps &props
   ) {
     MTLCommandBuffer_encodeTemporalScale(handle, scaler, color, output, depth, motion, exposure, fence, &props);
+  }
+
+  void
+  encodeFrameInterpolate(
+      FXFrameInterpolator interpolator, Texture color, Texture prev_color, Texture depth, Texture motion,
+      Texture output, Texture ui, Fence fence, const WMTFXFrameInterpolatorProps &props
+  ) {
+    MTLCommandBuffer_encodeFrameInterpolate(
+        handle, interpolator, color, prev_color, depth, motion, output, ui, fence, &props
+    );
   }
 };
 
@@ -963,6 +977,11 @@ public:
     return Reference<FXSpatialScaler>(MTLDevice_newSpatialScaler(handle, &info));
   }
 
+  Reference<FXFrameInterpolator>
+  newFrameInterpolator(const WMTFXFrameInterpolatorInfo &info) {
+    return Reference<FXFrameInterpolator>(MTLDevice_newFrameInterpolator(handle, &info));
+  }
+
   Reference<BinaryArchive>
   newBinaryArchive(const char *url, Error &error) {
     return Reference<BinaryArchive>(MTLDevice_newBinaryArchive(handle, url, &error.handle));
@@ -976,6 +995,11 @@ public:
   bool
   supportsFXTemporalScaler() {
     return MTLDevice_supportsFXTemporalScaler(handle);
+  }
+
+  bool
+  supportsFXFrameInterpolator() {
+    return MTLDevice_supportsFXFrameInterpolator(handle);
   }
 
   void

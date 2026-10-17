@@ -1744,6 +1744,48 @@ WINEMETAL_API void MTLCommandBuffer_encodeSpatialScale(
     obj_handle_t cmdbuf, obj_handle_t scaler, obj_handle_t color, obj_handle_t output, obj_handle_t fence
 );
 
+/** Frame interpolator create info. `scaler` must be an attachable temporal (or
+ *  temporal-denoised) scaler handle — Apple MTLFXFrameInterpolatableScaler. */
+struct WMTFXFrameInterpolatorInfo {
+  enum WMTPixelFormat color_format;
+  enum WMTPixelFormat output_format;
+  enum WMTPixelFormat depth_format;
+  enum WMTPixelFormat motion_format;
+  enum WMTPixelFormat ui_format; /* WMTPixelFormatInvalid = unset */
+  uint32_t input_width;
+  uint32_t input_height;
+  uint32_t output_width;
+  uint32_t output_height;
+  obj_handle_t scaler; /* MTLFXTemporalScaler / FrameInterpolatableScaler */
+  bool requires_prev_color_texture;
+};
+
+struct WMTFXFrameInterpolatorProps {
+  bool should_reset_history;
+  bool depth_reversed;
+  float motion_vector_scale_x;
+  float motion_vector_scale_y;
+  float jitter_offset_x;
+  float jitter_offset_y;
+  float delta_time;
+  float near_plane;
+  float far_plane;
+  float field_of_view;
+  float aspect_ratio;
+};
+
+WINEMETAL_API obj_handle_t MTLDevice_newFrameInterpolator(
+    obj_handle_t device, const struct WMTFXFrameInterpolatorInfo *info
+);
+
+WINEMETAL_API void MTLCommandBuffer_encodeFrameInterpolate(
+    obj_handle_t cmdbuf, obj_handle_t interpolator, obj_handle_t color, obj_handle_t prev_color,
+    obj_handle_t depth, obj_handle_t motion, obj_handle_t output, obj_handle_t ui, obj_handle_t fence,
+    const struct WMTFXFrameInterpolatorProps *props
+);
+
+WINEMETAL_API bool MTLDevice_supportsFXFrameInterpolator(obj_handle_t device);
+
 WINEMETAL_API obj_handle_t NSString_string(const char *data, enum WMTStringEncoding encoding);
 
 WINEMETAL_API obj_handle_t NSString_alloc_init(const char *data, enum WMTStringEncoding encoding);

@@ -588,6 +588,30 @@ ArgumentEncodingContext::upscaleTemporal(
 }
 
 void
+ArgumentEncodingContext::interpolateFrame(
+    Rc<Texture> &color, Rc<Texture> &prev_color, Rc<Texture> &depth, Rc<Texture> &motion_vector,
+    TextureViewKey mvViewId, Rc<Texture> &output, Rc<FrameInterpolator> &interpolator,
+    const WMTFXFrameInterpolatorProps &props
+) {
+  assert(!encoder_current);
+  auto encoder_info = allocate<FrameInterpolateData>();
+  encoder_info->type = EncoderType::FrameInterpolate;
+  encoder_info->id = nextEncoderId();
+  encoder_info->fence_wait = {};
+  encoder_info->fence_update = {encoder_info->id};
+  encoder_info->interpolator = interpolator;
+  encoder_info->props = props;
+
+  encoder_current = encoder_info;
+  encoder_info->color = access(color, color->fullView, ResourceAccess::Read).texture;
+  encoder_info->prev_color = access(prev_color, prev_color->fullView, ResourceAccess::Read).texture;
+  encoder_info->depth = access(depth, depth->fullView, ResourceAccess::Read).texture;
+  encoder_info->motion_vector = access(motion_vector, mvViewId, ResourceAccess::Read).texture;
+  encoder_info->output = access(output, output->fullView, ResourceAccess::Write).texture;
+  endPass();
+}
+
+void
 ArgumentEncodingContext::signalEvent(uint64_t value) {
   assert(!encoder_current);
   auto encoder_info = allocate<SignalEventData>();
@@ -1212,6 +1236,29 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       data->fence_update.forEach([&](auto id) { end_scaler.updateFence(fence_pool_[id]); });
       end_scaler.endEncoding();
       data->~TemporalUpscaleData();
+      break;
+    }
+    case EncoderType::FrameInterpolate: {
+      auto data = static_cast<FrameInterpolateData *>(current);
+
+      auto begin_interp = cmdbuf.blitCommandEncoder();
+      begin_interp.setLabel(WMT::String::string("BeginFrameInterpolate", WMTUTF8StringEncoding));
+      data->fence_wait.forEach([&](auto id) { begin_interp.waitForFence(fence_pool_[id]); });
+      begin_interp.updateFence(data->interpolator->fence());
+      begin_interp.endEncoding();
+
+      WMT::Texture ui{};
+      cmdbuf.encodeFrameInterpolate(
+          data->interpolator->interpolator(), data->color, data->prev_color, data->depth, data->motion_vector,
+          data->output, ui, data->interpolator->fence(), data->props
+      );
+
+      auto end_interp = cmdbuf.blitCommandEncoder();
+      end_interp.waitForFence(data->interpolator->fence());
+      end_interp.setLabel(WMT::String::string("EndFrameInterpolate", WMTUTF8StringEncoding));
+      data->fence_update.forEach([&](auto id) { end_interp.updateFence(fence_pool_[id]); });
+      end_interp.endEncoding();
+      data->~FrameInterpolateData();
       break;
     }
     case EncoderType::SampleTimestamp: {

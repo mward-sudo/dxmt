@@ -47,4 +47,27 @@ private:
   std::atomic<uint32_t> refcount_;
 };
 
+class FrameInterpolator {
+public:
+  void incRef();
+  void decRef();
+
+  FrameInterpolator(WMT::Device device, const WMTFXFrameInterpolatorInfo &info);
+
+  WMT::FXFrameInterpolator interpolator() {
+    return interpolator_;
+  }
+
+  WMT::Fence fence() {
+    return fence_;
+  }
+
+  explicit operator bool() const { return (bool)interpolator_; }
+
+private:
+  WMT::Reference<WMT::FXFrameInterpolator> interpolator_;
+  WMT::Reference<WMT::Fence> fence_;
+  std::atomic<uint32_t> refcount_;
+};
+
 } // namespace dxmt

@@ -1514,6 +1514,86 @@ _MTLCommandBuffer_encodeSpatialScale(void *obj) {
 }
 
 static NTSTATUS
+_MTLDevice_newFrameInterpolator(void *obj) {
+  struct unixcall_mtldevice_newfxframeinterpolator *params = obj;
+  params->ret = 0;
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+  if (@available(macOS 26.0, *)) {
+    MTLFXFrameInterpolatorDescriptor *desc = [[MTLFXFrameInterpolatorDescriptor alloc] init];
+    const struct WMTFXFrameInterpolatorInfo *info = params->info.ptr;
+    desc.colorTextureFormat = to_metal_pixel_format(info->color_format);
+    desc.outputTextureFormat = to_metal_pixel_format(info->output_format);
+    desc.depthTextureFormat = to_metal_pixel_format(info->depth_format);
+    desc.motionTextureFormat = to_metal_pixel_format(info->motion_format);
+    if (info->ui_format != WMTPixelFormatInvalid)
+      desc.uiTextureFormat = to_metal_pixel_format(info->ui_format);
+    desc.inputWidth = info->input_width;
+    desc.inputHeight = info->input_height;
+    desc.outputWidth = info->output_width;
+    desc.outputHeight = info->output_height;
+    /* Colocation: attach Apple MTLFXFrameInterpolatableScaler (temporal). */
+    if (info->scaler)
+      desc.scaler = (id<MTLFXFrameInterpolatableScaler>)info->scaler;
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 270000
+    if (@available(macOS 27.0, *)) {
+      desc.requiresPrevColorTexture = info->requires_prev_color_texture;
+    }
+#endif
+    params->ret = (obj_handle_t)[desc newFrameInterpolatorWithDevice:(id<MTLDevice>)params->device];
+    [desc release];
+  }
+#endif
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLCommandBuffer_encodeFrameInterpolate(void *obj) {
+  struct unixcall_mtlcommandbuffer_frame_interpolate *params = obj;
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+  if (@available(macOS 26.0, *)) {
+    id<MTLCommandBuffer> cmdbuf = (id<MTLCommandBuffer>)params->cmdbuf;
+    id<MTLFXFrameInterpolator> interpolator = (id<MTLFXFrameInterpolator>)params->interpolator;
+    interpolator.colorTexture = (id<MTLTexture>)params->color;
+    interpolator.prevColorTexture = (id<MTLTexture>)params->prev_color;
+    interpolator.depthTexture = (id<MTLTexture>)params->depth;
+    interpolator.motionTexture = (id<MTLTexture>)params->motion;
+    interpolator.outputTexture = (id<MTLTexture>)params->output;
+    if (params->ui)
+      interpolator.uiTexture = (id<MTLTexture>)params->ui;
+    interpolator.fence = (id<MTLFence>)params->fence;
+    const struct WMTFXFrameInterpolatorProps *props = params->props.ptr;
+    interpolator.shouldResetHistory = props->should_reset_history;
+    interpolator.depthReversed = props->depth_reversed;
+    interpolator.motionVectorScaleX = props->motion_vector_scale_x;
+    interpolator.motionVectorScaleY = props->motion_vector_scale_y;
+    interpolator.jitterOffsetX = props->jitter_offset_x;
+    interpolator.jitterOffsetY = props->jitter_offset_y;
+    interpolator.deltaTime = props->delta_time;
+    interpolator.nearPlane = props->near_plane;
+    interpolator.farPlane = props->far_plane;
+    interpolator.fieldOfView = props->field_of_view;
+    interpolator.aspectRatio = props->aspect_ratio;
+    [interpolator encodeToCommandBuffer:cmdbuf];
+  }
+#else
+  (void)params;
+#endif
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_supportsFXFrameInterpolator(void *obj) {
+  struct unixcall_generic_obj_uint64_ret *params = obj;
+  params->ret = 0;
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+  if (@available(macOS 26.0, *)) {
+    params->ret = [MTLFXFrameInterpolatorDescriptor supportsDevice:(id<MTLDevice>)params->handle];
+  }
+#endif
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 _NSString_string(void *obj) {
   struct unixcall_nsstring_string *params = obj;
   NSString *str = [NSString stringWithCString:params->buffer_ptr.ptr encoding:(NSStringEncoding)params->encoding];
@@ -3310,6 +3390,9 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLDevice_newIndirectCommandBuffer,
     &_MTLDevice_newLibraryWithSource,
     &_MTLTexture_getBytes,
+    &_MTLDevice_newFrameInterpolator,
+    &_MTLCommandBuffer_encodeFrameInterpolate,
+    &_MTLDevice_supportsFXFrameInterpolator,
 };
 
 #ifndef DXMT_NATIVE
@@ -3460,5 +3543,8 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLDevice_newIndirectCommandBuffer,
     &_MTLDevice_newLibraryWithSource,
     &_MTLTexture_getBytes,
+    &_MTLDevice_newFrameInterpolator,
+    &_MTLCommandBuffer_encodeFrameInterpolate,
+    &_MTLDevice_supportsFXFrameInterpolator,
 };
 #endif

@@ -604,6 +604,45 @@ MTLCommandBuffer_encodeSpatialScale(
 }
 
 WINEMETAL_API obj_handle_t
+MTLDevice_newFrameInterpolator(obj_handle_t device, const struct WMTFXFrameInterpolatorInfo *info) {
+  struct unixcall_mtldevice_newfxframeinterpolator params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  params.ret = NULL_OBJECT_HANDLE;
+  UNIX_CALL(146, &params);
+  return params.ret;
+}
+
+WINEMETAL_API void
+MTLCommandBuffer_encodeFrameInterpolate(
+    obj_handle_t cmdbuf, obj_handle_t interpolator, obj_handle_t color, obj_handle_t prev_color,
+    obj_handle_t depth, obj_handle_t motion, obj_handle_t output, obj_handle_t ui, obj_handle_t fence,
+    const struct WMTFXFrameInterpolatorProps *props
+) {
+  struct unixcall_mtlcommandbuffer_frame_interpolate params;
+  params.cmdbuf = cmdbuf;
+  params.interpolator = interpolator;
+  params.color = color;
+  params.prev_color = prev_color;
+  params.depth = depth;
+  params.motion = motion;
+  params.output = output;
+  params.ui = ui;
+  params.fence = fence;
+  WMT_MEMPTR_SET(params.props, props);
+  UNIX_CALL(147, &params);
+}
+
+WINEMETAL_API bool
+MTLDevice_supportsFXFrameInterpolator(obj_handle_t device) {
+  struct unixcall_generic_obj_uint64_ret params;
+  params.handle = device;
+  params.ret = 0;
+  UNIX_CALL(148, &params);
+  return params.ret;
+}
+
+WINEMETAL_API obj_handle_t
 NSString_string(const char *data, enum WMTStringEncoding encoding) {
   struct unixcall_nsstring_string params;
   WMT_MEMPTR_SET(params.buffer_ptr, data);

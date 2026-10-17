@@ -119,6 +119,7 @@ enum class EncoderType {
   TemporalUpscale,
   WaitForEvent,
   SampleTimestamp,
+  FrameInterpolate,
 };
 
 struct EncoderData {
@@ -283,6 +284,17 @@ struct TemporalUpscaleData : EncoderData {
   WMT::Reference<WMT::Texture> exposure;
   Rc<TemporalScaler> scaler;
   WMTFXTemporalScalerProps props;
+};
+
+struct FrameInterpolateData : EncoderData {
+  WMT::Reference<WMT::Texture> color;
+  WMT::Reference<WMT::Texture> prev_color;
+  WMT::Reference<WMT::Texture> depth;
+  WMT::Reference<WMT::Texture> motion_vector;
+  WMT::Reference<WMT::Texture> output;
+  WMT::Reference<WMT::Texture> ui;
+  Rc<FrameInterpolator> interpolator;
+  WMTFXFrameInterpolatorProps props;
 };
 
 template <PipelineKind kind>
@@ -672,6 +684,12 @@ public:
   void upscaleTemporal(
       Rc<Texture> &input, Rc<Texture> &output, Rc<Texture> &depth, Rc<Texture> &motion_vector, TextureViewKey mvViewId,
       Rc<Texture> &exposure, Rc<TemporalScaler> &scaler, const WMTFXTemporalScalerProps &props
+  );
+
+  void interpolateFrame(
+      Rc<Texture> &color, Rc<Texture> &prev_color, Rc<Texture> &depth, Rc<Texture> &motion_vector,
+      TextureViewKey mvViewId, Rc<Texture> &output, Rc<FrameInterpolator> &interpolator,
+      const WMTFXFrameInterpolatorProps &props
   );
 
   void signalEvent(uint64_t value);
