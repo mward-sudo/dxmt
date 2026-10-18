@@ -1243,6 +1243,24 @@ public:
       present_dm::logStep("present1:prev_color_update_begin");
       UpdatePresentPrevColor();
       present_dm::logStep("present1:prev_color_update_end");
+      // Arm D RB copies must follow temporal emitcc (Crash I class: CopySubresourceRegion
+      // during export leaves encoder_current set → assert !encoder_current).
+      if (present_dm::mvReadbackEnabled()) [[unlikely]] {
+        present_dm::logStep("present1:mv_rb_copy_tick_begin");
+        const uint32_t rb_log_base = present_dm::mvProbePreparedLogCount();
+        present_dm::noteMvReadbackCopyTick(
+            device_, device_context_, presentation_count_, backbuffer_desc_.Width,
+            backbuffer_desc_.Height
+        );
+        const uint32_t rb_n = present_dm::mvProbePreparedLogCount();
+        for (uint32_t i = rb_log_base; i < rb_n; i++) {
+          if (const char *line = present_dm::mvProbePreparedLogAt(i))
+            LogMvProbeStrategy(line);
+        }
+        if (rb_n > rb_log_base)
+          present_dm::mvProbeClearPreparedLogs();
+        present_dm::logStep("present1:mv_rb_copy_tick_end");
+      }
     }
 
     // Crash I evidence: ExportPresentDepthMotion (ClearRTV estimates / CopyResource)
@@ -2469,7 +2487,7 @@ private:
         }
       }
       if (present_dm::mvReadbackEnabled()) {
-        present_dm::noteMvReadbackTick(
+        present_dm::noteMvReadbackMapTick(
             device_, device_context_, present_n, backbuffer_desc_.Width,
             backbuffer_desc_.Height
         );
@@ -2478,8 +2496,7 @@ private:
           if (const char *line = present_dm::mvProbePreparedLogAt(i))
             LogMvProbeStrategy(line);
         }
-        if (rb_n > probe_log_emitted)
-          present_dm::mvProbeClearPreparedLogs();
+        /* rb_stats / copy-phase logs emit after emitcc in Present1. */
       } else if (probe_log_emitted != 0) {
         present_dm::mvProbeClearPreparedLogs();
       }

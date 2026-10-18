@@ -1030,7 +1030,19 @@ queueMvRbSample(
 }
 
 void
-runMvReadbackTickLocked(
+runMvReadbackMapTickLocked(
+    DeviceState *st, ID3D11DeviceContext *ctx, uint64_t presentation_count
+) {
+  if (!st || !ctx)
+    return;
+  for (size_t i = 0; i < kMvRbMaxSlots; i++) {
+    if (st->mv_rb_pending[i].active)
+      tryMapMvRbPending(st, &st->mv_rb_pending[i], ctx, presentation_count);
+  }
+}
+
+void
+runMvReadbackCopyTickLocked(
     DeviceState *st, ID3D11Device *device, ID3D11DeviceContext *ctx,
     uint64_t presentation_count
 ) {
@@ -1038,12 +1050,6 @@ runMvReadbackTickLocked(
     return;
   const auto t0 = std::chrono::steady_clock::now();
   bool any_rb = false;
-  for (size_t i = 0; i < kMvRbMaxSlots; i++) {
-    if (st->mv_rb_pending[i].active) {
-      if (tryMapMvRbPending(st, &st->mv_rb_pending[i], ctx, presentation_count))
-        any_rb = true;
-    }
-  }
   const uint32_t max_c = mvProbeRbMaxCandidatesCached();
   const uint32_t tiles = mvProbeRbTilesCached();
   std::vector<uint32_t> order;
@@ -1093,6 +1099,24 @@ runMvReadbackTickLocked(
   st->mv_rb_stats.probe_us =
       (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
   logRbStats(st);
+}
+
+static bool
+beginMvReadbackTick(
+    ID3D11Device *device, ID3D11DeviceContext *ctx, uint64_t presentation_count,
+    UINT swapchain_w, UINT swapchain_h
+) {
+  if (!mvReadbackEnabled() || !device || !ctx)
+    return false;
+  if (!mvRbNoWaitAllowed())
+    return false;
+  g_mv_probe_present_count.store(presentation_count, std::memory_order_relaxed);
+  g_mv_probe_swap_w.store(swapchain_w, std::memory_order_relaxed);
+  g_mv_probe_swap_h.store(swapchain_h, std::memory_order_relaxed);
+  const uint32_t rb_period = mvProbeRbPeriodCached();
+  if (rb_period == 0 || presentation_count % rb_period != 0)
+    return false;
+  return true;
 }
 
 void
@@ -1746,25 +1770,31 @@ noteDepthStencilState(
 }
 
 void
-noteMvReadbackTick(
+noteMvReadbackMapTick(
     ID3D11Device *device, ID3D11DeviceContext *ctx, uint64_t presentation_count,
     UINT swapchain_w, UINT swapchain_h
 ) {
-  if (!mvReadbackEnabled() || !device || !ctx)
-    return;
-  if (!mvRbNoWaitAllowed())
-    return;
-  g_mv_probe_present_count.store(presentation_count, std::memory_order_relaxed);
-  g_mv_probe_swap_w.store(swapchain_w, std::memory_order_relaxed);
-  g_mv_probe_swap_h.store(swapchain_h, std::memory_order_relaxed);
-  const uint32_t rb_period = mvProbeRbPeriodCached();
-  if (rb_period == 0 || presentation_count % rb_period != 0)
+  if (!beginMvReadbackTick(device, ctx, presentation_count, swapchain_w, swapchain_h))
     return;
   std::lock_guard<std::mutex> lock(g_lock);
   DeviceState *st = stateFor(device);
   if (!st)
     return;
-  runMvReadbackTickLocked(st, device, ctx, presentation_count);
+  runMvReadbackMapTickLocked(st, ctx, presentation_count);
+}
+
+void
+noteMvReadbackCopyTick(
+    ID3D11Device *device, ID3D11DeviceContext *ctx, uint64_t presentation_count,
+    UINT swapchain_w, UINT swapchain_h
+) {
+  if (!beginMvReadbackTick(device, ctx, presentation_count, swapchain_w, swapchain_h))
+    return;
+  std::lock_guard<std::mutex> lock(g_lock);
+  DeviceState *st = stateFor(device);
+  if (!st)
+    return;
+  runMvReadbackCopyTickLocked(st, device, ctx, presentation_count);
 }
 
 void

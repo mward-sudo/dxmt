@@ -102,7 +102,13 @@ void noteSceneDrawForMvProbe(
 void noteMvProbePresent(uint64_t presentation_count);
 /** Arm D: rate-limited staging readback (`DXMT_MV_PROBE_RB=1`). */
 bool mvReadbackEnabled();
-void noteMvReadbackTick(
+/** Map/consume prior RB staging (no GPU copies). Safe before temporal emitcc. */
+void noteMvReadbackMapTick(
+    ID3D11Device *device, ID3D11DeviceContext *ctx, uint64_t presentation_count,
+    UINT swapchain_w, UINT swapchain_h
+);
+/** Queue CopySubresourceRegion RB samples — must run after temporal emitcc. */
+void noteMvReadbackCopyTick(
     ID3D11Device *device, ID3D11DeviceContext *ctx, uint64_t presentation_count,
     UINT swapchain_w, UINT swapchain_h
 );
