@@ -71,6 +71,41 @@ uint64_t unifiedFiPresentCount();
 void trackSceneDepth(ID3D11DepthStencilView *dsv);
 
 /**
+ * Tip 27a: default-off MV source census (`DXMT_MV_PROBE=1`). Log-only — never
+ * binds motion, never changes provenance, never opens the tip-19 FI gate.
+ */
+bool mvProbeEnabled();
+/** True during a sampled Present while Arm B may still scan draws. */
+bool mvProbeArmBActive();
+/** Presents between census dumps; `DXMT_MV_PROBE_PERIOD`, default 600. */
+uint32_t mvProbePeriod();
+/** Arm A: aggregate RTV binds at OMSetRenderTargets (desc metadata only). */
+void noteRenderTargetBind(
+    ID3D11RenderTargetView *const *rtvs, UINT num_rtvs, ID3D11DepthStencilView *dsv
+);
+/**
+ * Arm B: structural VS CB projection scan. Call from PreDraw with bound VS CB
+ * slots; scans at most the first 2 draws after scene DSV in a sampled Present.
+ */
+struct MvProbeCbSlot {
+  ID3D11Resource *buffer = nullptr;
+  UINT first_constant = 0;
+  UINT num_constants = 0;
+};
+void noteSceneDrawForMvProbe(ID3D11Device *device, const MvProbeCbSlot slots[14]);
+/** Advance Present tick: arm Arm B for the next sampled Present. */
+void noteMvProbePresent(uint64_t presentation_count);
+/**
+ * Build period-aggregated `mv_probe=` lines and reset census counters.
+ * Caller emits via swapchain LogMvProbeStrategy (or mvProbeEmitPreparedLogs).
+ */
+void logMvProbeCensus(uint64_t presentation_count);
+uint32_t mvProbePreparedLogCount();
+const char *mvProbePreparedLogAt(uint32_t index);
+/** Fallback emitter when the swapchain helper is unavailable. */
+void mvProbeEmitPreparedLogs();
+
+/**
  * Resolve a depth resource for Present export.
  * Prefer last tracked scene DSV (exact size match with color); else OM DSV at
  * Present; else title TemporalUpscale depth. Returns AddRef'd resource when true.

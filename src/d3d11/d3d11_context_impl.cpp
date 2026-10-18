@@ -2878,8 +2878,14 @@ public:
           OMResolveSRVHazard(dsv);
         }
         // present-dm: remember scene depth while bound (often unbound by Present).
-        if (device->GetImmediateContextPrivate() == static_cast<IMTLD3D11DeviceContext *>(this))
+        if (device->GetImmediateContextPrivate() == static_cast<IMTLD3D11DeviceContext *>(this)) {
           present_dm::trackSceneDepth(dsv);
+          if (present_dm::mvProbeEnabled()) [[unlikely]] {
+            present_dm::noteRenderTargetBind(
+                ppRenderTargetViews, NumRTVs, pDepthStencilView
+            );
+          }
+        }
       } else {
         if (state_.OutputMerger.DSV) {
           should_invalidate_pass = true;
@@ -4867,6 +4873,23 @@ public:
   template <bool IndexedDraw>
   DrawCallStatus
   PreDraw() {
+    if (present_dm::mvProbeArmBActive()) [[unlikely]] {
+      present_dm::MvProbeCbSlot slots[14]{};
+      auto &cbs = state_.ShaderStages[PipelineStage::Vertex].ConstantBuffers;
+      for (UINT slot = 0; slot < 14; slot++) {
+        if (!cbs.test_bound(slot))
+          continue;
+        auto &entry = cbs[slot];
+        if (!entry.Buffer)
+          continue;
+        slots[slot].buffer = entry.Buffer.ptr();
+        slots[slot].first_constant = entry.FirstConstant;
+        slots[slot].num_constants = entry.NumConstants;
+      }
+      present_dm::noteSceneDrawForMvProbe(
+          static_cast<ID3D11Device *>(device), slots
+      );
+    }
     DrawCallStatus status;
     if constexpr (IndexedDraw) {
       if (!state_.InputAssembler.IndexBuffer)

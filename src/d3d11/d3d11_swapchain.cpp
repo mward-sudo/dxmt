@@ -1821,6 +1821,19 @@ private:
     LogDepthResolveStrategy(std::string(tag));
   }
 
+  void LogMvProbeStrategy(const std::string &tag) {
+    if (last_mv_probe_log_ == tag)
+      return;
+    last_mv_probe_log_ = tag;
+    WARN("unified-metalfx: mv_probe=", tag.c_str());
+  }
+
+  void LogMvProbeStrategy(const char *tag) {
+    if (!tag)
+      return;
+    LogMvProbeStrategy(std::string(tag));
+  }
+
   /** Tip 17: Uninitialised → Cooldown(n) → Creating → Stable (one log / transition). */
   enum class TemporalGuardPhase : uint8_t {
     Uninitialised = 0,
@@ -2441,6 +2454,20 @@ private:
           encode_label ? encode_label : "spatial_encode=color_only"
       );
     }
+    if (present_dm::mvProbeEnabled()) [[unlikely]] {
+      const uint64_t present_n = presentation_count_ + 1;
+      const uint32_t period = present_dm::mvProbePeriod();
+      if (period != 0 && present_n % period == 0) {
+        last_mv_probe_log_.clear();
+        present_dm::logMvProbeCensus(present_n);
+        const uint32_t n = present_dm::mvProbePreparedLogCount();
+        for (uint32_t i = 0; i < n; i++) {
+          if (const char *line = present_dm::mvProbePreparedLogAt(i))
+            LogMvProbeStrategy(line);
+        }
+      }
+      present_dm::noteMvProbePresent(present_n);
+    }
     present_dm::logStep("export:exit");
     // Prev-color CopyResource is deferred to UpdatePresentPrevColor() after emitcc.
   }
@@ -2543,6 +2570,7 @@ private:
   std::string last_fi_encode_log_;
   std::string last_temporal_encode_log_;
   std::string last_depth_resolve_log_;
+  std::string last_mv_probe_log_;
   /** Deferred present-dm log until temporal encode/skip decision (honest label). */
   bool present_dm_log_pending_ = false;
   bool present_dm_prev_valid_ = false;
