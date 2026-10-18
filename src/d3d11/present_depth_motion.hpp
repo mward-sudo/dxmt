@@ -15,8 +15,11 @@
  *   DXMT_PRESENT_DM_EXPORT=0 — force export off even when unified is armed.
  *   DXMT_PRESENT_DM_VERBOSE=1 — log every Present (not just #1–3 / %300).
  *   DXMT_PRESENT_DM_STEPS=1 — step markers inside resolve/export (also on with VERBOSE).
- *   DXMT_PRESENT_DM_TRACKED_DEPTH=0 — never use g_tracked_depth.
+ *   DXMT_PRESENT_DM_TRACKED_DEPTH=0 — never use per-device tracked depth.
  *   DXMT_PRESENT_DM_OM_DEPTH=0 — never call OMGetRenderTargets at Present.
+ *
+ * Tip 15: tracked/title depth+motion are scoped per ID3D11Device (not process
+ * globals) and cleared on device teardown. Size match for bind is exact.
  */
 #pragma once
 
@@ -41,6 +44,9 @@ bool stepsEnabled();
 /** Emit a Present-path step marker (no-op unless stepsEnabled()). */
 void logStep(const char *step);
 
+/** Drop per-device tracked/title state (call from device teardown). */
+void clearDevice(ID3D11Device *device);
+
 void noteTemporalUpscale(
     ID3D11Resource *color, ID3D11Resource *depth, ID3D11Resource *motion_vector
 );
@@ -48,12 +54,12 @@ void noteTemporalUpscale(
 /** TemporalUpscale / title path count visible inside d3d11.dll (Present proof). */
 uint64_t temporalUpscaleCount();
 
-/** Track last immediate-context scene DSV (may be unbound at Present). */
+/** Track last immediate-context scene DSV for this device (may be unbound at Present). */
 void trackSceneDepth(ID3D11DepthStencilView *dsv);
 
 /**
  * Resolve a depth resource for Present export.
- * Prefer last tracked scene DSV (size-compatible with color); else OM DSV at
+ * Prefer last tracked scene DSV (exact size match with color); else OM DSV at
  * Present; else title TemporalUpscale depth. Returns AddRef'd resource when true.
  * Kill-switches: DXMT_PRESENT_DM_TRACKED_DEPTH=0 / DXMT_PRESENT_DM_OM_DEPTH=0.
  */
@@ -63,11 +69,12 @@ bool resolveDepthForPresent(
 );
 
 /**
- * If TemporalUpscale / NGX supplied motion this process, return last MV resource
- * (AddRef'd). Otherwise false → caller may try labeled estimate, else report
- * REAL_MOTION_UNAVAILABLE.
+ * If TemporalUpscale / NGX supplied motion for this device, return last MV
+ * resource (AddRef'd). Otherwise false → caller may try labeled estimate.
  */
-bool resolveTitleMotion(ID3D11Resource **out_motion, const char **out_provenance);
+bool resolveTitleMotion(
+    ID3D11Device *device, ID3D11Resource **out_motion, const char **out_provenance
+);
 
 /** True when provenance is an ESTIMATE_* label (not engine / title truth). */
 bool isLabeledEstimate(const char *provenance);

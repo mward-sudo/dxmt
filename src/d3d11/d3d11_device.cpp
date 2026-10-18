@@ -22,6 +22,7 @@
 #include "ftl.hpp"
 #include "d3d11_resource.hpp"
 #include "dxgi_object.hpp"
+#include "present_depth_motion.hpp"
 #include <memory>
 #include "d3d11_4.h"
 #include "util_win32_compat.h"
@@ -1151,6 +1152,8 @@ public:
   }
 
   ~MTLD3D11DXGIDevice() {
+    // Tip 15: drop per-device present-dm tracked/title resources before teardown.
+    present_dm::clearDevice(&d3d11_device_);
     if (local_kmt_) {
       D3DKMT_DESTROYDEVICE destroy = {};
       destroy.hDevice = local_kmt_;

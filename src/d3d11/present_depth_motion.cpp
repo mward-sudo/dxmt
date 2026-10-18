@@ -4,6 +4,7 @@
 #include "util_env.hpp"
 #include <atomic>
 #include <mutex>
+#include <unordered_map>
 
 namespace dxmt {
 namespace present_dm {
@@ -12,14 +13,19 @@ namespace {
 
 std::atomic<uint64_t> g_temporal_upscale_count{0};
 
-std::mutex g_lock;
-dxmt::Com<ID3D11Resource> g_tracked_depth;
-UINT g_tracked_w = 0;
-UINT g_tracked_h = 0;
+/** Per-device Present-dm state (tip 15). Key is raw ID3D11Device*; cleared in
+ *  clearDevice on teardown — do not AddRef the map key. */
+struct DeviceState {
+  dxmt::Com<ID3D11Resource> tracked_depth;
+  UINT tracked_w = 0;
+  UINT tracked_h = 0;
+  dxmt::Com<ID3D11Resource> title_motion;
+  dxmt::Com<ID3D11Resource> title_depth;
+  bool title_motion_valid = false;
+};
 
-dxmt::Com<ID3D11Resource> g_title_motion;
-dxmt::Com<ID3D11Resource> g_title_depth;
-bool g_title_motion_valid = false;
+std::mutex g_lock;
+std::unordered_map<ID3D11Device *, DeviceState> g_by_device;
 
 bool
 envIsZero(const char *name) {
@@ -31,17 +37,11 @@ envIsOne(const char *name) {
   return env::getEnvVar(name) == "1";
 }
 
+/** Exact size match for MetalFX bind (tip 15) — half/double rejected. */
 bool
-sizeCompatible(UINT color_w, UINT color_h, UINT depth_w, UINT depth_h) {
-  if (depth_w == 0 || depth_h == 0 || color_w == 0 || color_h == 0)
-    return false;
-  if (depth_w == color_w && depth_h == color_h)
-    return true;
-  if (depth_w * 2 == color_w && depth_h * 2 == color_h)
-    return true;
-  if (color_w * 2 == depth_w && color_h * 2 == depth_h)
-    return true;
-  return false;
+sizeExact(UINT color_w, UINT color_h, UINT depth_w, UINT depth_h) {
+  return depth_w != 0 && depth_h != 0 && color_w != 0 && color_h != 0 &&
+         depth_w == color_w && depth_h == color_h;
 }
 
 bool
@@ -67,26 +67,54 @@ prevValidLabel(bool prev_color_valid) {
 
 bool
 trackedDepthAllowed() {
-  // Default on; DXMT_PRESENT_DM_TRACKED_DEPTH=0 disables for bisection.
   return !envIsZero("DXMT_PRESENT_DM_TRACKED_DEPTH");
 }
 
 bool
 omDepthAllowed() {
-  // Default on; DXMT_PRESENT_DM_OM_DEPTH=0 disables for bisection.
   return !envIsZero("DXMT_PRESENT_DM_OM_DEPTH");
+}
+
+/** GetDevice AddRefs; we Release immediately and keep the raw pointer as map key. */
+ID3D11Device *
+deviceKeyFromChild(ID3D11DeviceChild *child) {
+  if (!child)
+    return nullptr;
+  ID3D11Device *dev = nullptr;
+  child->GetDevice(&dev);
+  if (!dev)
+    return nullptr;
+  ID3D11Device *key = dev;
+  dev->Release();
+  return key;
+}
+
+ID3D11Device *
+deviceKeyFromContext(ID3D11DeviceContext *ctx) {
+  if (!ctx)
+    return nullptr;
+  ID3D11Device *dev = nullptr;
+  ctx->GetDevice(&dev);
+  if (!dev)
+    return nullptr;
+  ID3D11Device *key = dev;
+  dev->Release();
+  return key;
+}
+
+DeviceState *
+stateFor(ID3D11Device *device) {
+  if (!device)
+    return nullptr;
+  return &g_by_device[device];
 }
 
 } // namespace
 
 bool
 enabled() {
-  // Bisection: DXMT_PRESENT_DM_EXPORT=0 kills all Present export (no OMGet,
-  // no tracked globals, no estimate fill) even when unified temporal is armed.
   if (envIsZero("DXMT_PRESENT_DM_EXPORT"))
     return false;
-  // Opt-in so daily spatial Present is unchanged unless proof/fork trial sets the env.
-  // Unified temporal Present implies the same export (map: DXMT_METALFX_UNIFIED_TEMPORAL_INTERP).
   return envIsOne("DXMT_PRESENT_DEPTH_MOTION") ||
          envIsOne("DXMT_METALFX_UNIFIED_TEMPORAL_INTERP");
 }
@@ -109,6 +137,14 @@ logStep(const char *step) {
 }
 
 void
+clearDevice(ID3D11Device *device) {
+  if (!device)
+    return;
+  std::lock_guard<std::mutex> lock(g_lock);
+  g_by_device.erase(device);
+}
+
+void
 noteTemporalUpscale(
     ID3D11Resource *color, ID3D11Resource *depth, ID3D11Resource *motion_vector
 ) {
@@ -116,10 +152,16 @@ noteTemporalUpscale(
   WARN(
       "present-dm: TemporalUpscale fired (count=", n, ") — title/NGX path has depth+motion"
   );
+  ID3D11Device *key = deviceKeyFromChild(depth ? depth : (color ? color : motion_vector));
+  if (!key)
+    return;
   std::lock_guard<std::mutex> lock(g_lock);
-  g_title_depth = depth;
-  g_title_motion = motion_vector;
-  g_title_motion_valid = motion_vector != nullptr;
+  DeviceState *st = stateFor(key);
+  if (!st)
+    return;
+  st->title_depth = depth;
+  st->title_motion = motion_vector;
+  st->title_motion_valid = motion_vector != nullptr;
   (void)color;
 }
 
@@ -130,7 +172,6 @@ temporalUpscaleCount() {
 
 void
 trackSceneDepth(ID3D11DepthStencilView *dsv) {
-  // EXPORT=0 / disabled: do not touch process-global tracked depth.
   if (!dsv || !enabled() || !trackedDepthAllowed())
     return;
   dxmt::Com<ID3D11Resource> resource;
@@ -140,13 +181,20 @@ trackSceneDepth(ID3D11DepthStencilView *dsv) {
   D3D11_TEXTURE2D_DESC desc{};
   if (!resourceTex2DDesc(resource.ptr(), &desc))
     return;
-  std::lock_guard<std::mutex> lock(g_lock);
-  // Prefer largest DSV seen (scene depth usually out-areas shadow maps).
-  if (g_tracked_depth && texArea(desc.Width, desc.Height) < texArea(g_tracked_w, g_tracked_h))
+  ID3D11Device *key = deviceKeyFromChild(dsv);
+  if (!key)
     return;
-  g_tracked_depth = resource.ptr();
-  g_tracked_w = desc.Width;
-  g_tracked_h = desc.Height;
+  std::lock_guard<std::mutex> lock(g_lock);
+  DeviceState *st = stateFor(key);
+  if (!st)
+    return;
+  // Prefer largest DSV seen on this device (scene depth usually out-areas shadow maps).
+  if (st->tracked_depth &&
+      texArea(desc.Width, desc.Height) < texArea(st->tracked_w, st->tracked_h))
+    return;
+  st->tracked_depth = resource.ptr();
+  st->tracked_w = desc.Width;
+  st->tracked_h = desc.Height;
 }
 
 bool
@@ -161,11 +209,14 @@ resolveDepthForPresent(
 
   logStep("resolve_depth:enter");
 
-  // Prefer fork-tracked scene depth (OM often unbound / wrong after post).
+  ID3D11Device *key = deviceKeyFromContext(ctx);
+
   if (trackedDepthAllowed()) {
     std::lock_guard<std::mutex> lock(g_lock);
-    if (g_tracked_depth && sizeCompatible(color_w, color_h, g_tracked_w, g_tracked_h)) {
-      *out_resource = g_tracked_depth.ref();
+    DeviceState *st = key ? stateFor(key) : nullptr;
+    if (st && st->tracked_depth &&
+        sizeExact(color_w, color_h, st->tracked_w, st->tracked_h)) {
+      *out_resource = st->tracked_depth.ref();
       *out_provenance = kDepthTracked;
       logStep("resolve_depth:tracked");
       return true;
@@ -185,7 +236,7 @@ resolveDepthForPresent(
       dsv->Release();
       D3D11_TEXTURE2D_DESC desc{};
       if (resource && resourceTex2DDesc(resource.ptr(), &desc) &&
-          sizeCompatible(color_w, color_h, desc.Width, desc.Height)) {
+          sizeExact(color_w, color_h, desc.Width, desc.Height)) {
         *out_resource = resource.ref();
         *out_provenance = kDepthOmAtPresent;
         logStep("resolve_depth:om_at_present");
@@ -196,13 +247,14 @@ resolveDepthForPresent(
     logStep("resolve_depth:om_disabled");
   }
 
-  {
+  if (key) {
     std::lock_guard<std::mutex> lock(g_lock);
-    if (g_title_depth) {
+    DeviceState *st = stateFor(key);
+    if (st && st->title_depth) {
       D3D11_TEXTURE2D_DESC desc{};
-      if (resourceTex2DDesc(g_title_depth.ptr(), &desc) &&
-          sizeCompatible(color_w, color_h, desc.Width, desc.Height)) {
-        *out_resource = g_title_depth.ref();
+      if (resourceTex2DDesc(st->title_depth.ptr(), &desc) &&
+          sizeExact(color_w, color_h, desc.Width, desc.Height)) {
+        *out_resource = st->title_depth.ref();
         *out_provenance = kDepthTitleTemporal;
         logStep("resolve_depth:title_temporal");
         return true;
@@ -215,15 +267,20 @@ resolveDepthForPresent(
 }
 
 bool
-resolveTitleMotion(ID3D11Resource **out_motion, const char **out_provenance) {
+resolveTitleMotion(
+    ID3D11Device *device, ID3D11Resource **out_motion, const char **out_provenance
+) {
   if (!out_motion || !out_provenance)
     return false;
   *out_motion = nullptr;
   *out_provenance = kMotionUnavailable;
-  std::lock_guard<std::mutex> lock(g_lock);
-  if (!g_title_motion_valid || !g_title_motion)
+  if (!device)
     return false;
-  *out_motion = g_title_motion.ref();
+  std::lock_guard<std::mutex> lock(g_lock);
+  auto it = g_by_device.find(device);
+  if (it == g_by_device.end() || !it->second.title_motion_valid || !it->second.title_motion)
+    return false;
+  *out_motion = it->second.title_motion.ref();
   *out_provenance = kMotionTitle;
   return true;
 }
@@ -232,7 +289,6 @@ bool
 isLabeledEstimate(const char *provenance) {
   if (!provenance)
     return false;
-  // ESTIMATE_* labels are fork-synthesized; never engine / title truth.
   return provenance[0] == 'E' && provenance[1] == 'S' && provenance[2] == 'T' &&
          provenance[3] == 'I' && provenance[4] == 'M' && provenance[5] == 'A' &&
          provenance[6] == 'T' && provenance[7] == 'E' && provenance[8] == '_';
@@ -244,7 +300,6 @@ logPresentTick(
     const char *depth_provenance, const char *motion_provenance, DXGI_FORMAT depth_format,
     const char *encode_label
 ) {
-  // Default: first 3 + every 300th. VERBOSE=1 closes the blind window before crashes.
   if (!verbose() && presentation_count > 3 && (presentation_count % 300) != 0)
     return;
   auto temporal = temporalUpscaleCount();

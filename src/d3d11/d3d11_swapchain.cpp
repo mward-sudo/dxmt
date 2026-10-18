@@ -2168,7 +2168,7 @@ private:
     Com<ID3D11Resource> motion_src;
     bool need_estimate_motion = true;
     present_dm::logStep("export:resolve_motion_begin");
-    if (present_dm::resolveTitleMotion(&motion_src, &motion_prov)) {
+    if (present_dm::resolveTitleMotion(device_, &motion_src, &motion_prov)) {
       if (EnsurePresentCopyTexture(present_motion_, motion_src.ptr(), 0)) {
         present_dm::logStep("export:motion_copy_begin");
         device_context_->CopyResource(
