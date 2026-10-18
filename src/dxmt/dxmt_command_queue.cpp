@@ -21,6 +21,7 @@
 #include "Metal.hpp"
 #include "dxmt_statistics.hpp"
 #include "util_env.hpp"
+#include "util_perf_gpu_window.hpp"
 #include "util_win32_compat.h"
 #include <atomic>
 
@@ -200,6 +201,9 @@ CommandQueue::WaitForFinishThread() {
     if (chunk.attached_cmdbuf.status() == WMTCommandBufferStatusError) {
       ERR("Device error at frame ", chunk.frame_, ": ", chunk.attached_cmdbuf.error().description().getUTF8String());
     }
+    perf_gpu_window::recordFinishedCommandBuffer(
+        chunk.attached_cmdbuf.gpuStartTime(), chunk.attached_cmdbuf.gpuEndTime()
+    );
     if (auto logs = chunk.attached_cmdbuf.logs()) {
       for (auto &log : logs.elements()) {
         ERR("Frame ", chunk.frame_, ": ", log.description().getUTF8String());

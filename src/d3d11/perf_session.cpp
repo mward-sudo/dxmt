@@ -2,6 +2,7 @@
 
 #include "log/log.hpp"
 #include "util_env.hpp"
+#include "util_perf_gpu_window.hpp"
 #include "util_string.hpp"
 #include "util_win32_compat.h"
 
@@ -21,7 +22,7 @@ namespace {
 
 using steady_clock = std::chrono::steady_clock;
 
-constexpr const char *kSchema = "dxmt-perf-session-v1";
+constexpr const char *kSchema = "dxmt-perf-session-v1.1";
 constexpr unsigned kSummaryPresentInterval = 60;
 constexpr double kSummaryWallSeconds = 1.0;
 
@@ -157,25 +158,67 @@ emitSummaryLocked(
   const double present_latency_ms =
       chronoDurationToMs(average.present_latency_interval);
 
-  g_out << std::format(
-      R"({{"type":"summary","t_ms":{},"presents":{},"rendered":{},"presented":{},"unified_encode":{},"unified_fi":{},"fps_avg":{:.3f},"fps_min":{:.3f},"fps_max":{:.3f},"frame_ms_avg":{:.3f},"frame_ms_min":{:.3f},"frame_ms_max":{:.3f},"encode_prepare_ms_avg":{:.3f},"encode_flush_ms_avg":{:.3f},"commit_ms_avg":{:.3f},"present_latency_ms_avg":{:.3f},"scaler":{{"type":"{}","in_w":{},"in_h":{},"out_w":{},"out_h":{}}},"cpu_pct":null,"gpu_pct":null,"gpu_pct_note":"not_implemented_use_metal_gpu_counters"}})",
-      t_ms, counters.presents, counters.rendered, counters.presented,
-      counters.unified_encode, counters.unified_fi, fps_avg, fps_min, fps_max,
-      frame_ms_avg, frame_ms_min, frame_ms_max, encode_prepare_ms, encode_flush_ms,
-      commit_ms, present_latency_ms, scalerTypeName(info.type), info.input_width,
-      info.input_height, info.output_width, info.output_height
-  ) << '\n';
+  const auto gpu_snap = perf_gpu_window::takeWindowSnapshotAndReset();
+  const unsigned gpu_cb_finished = gpu_snap ? gpu_snap->command_buffers : 0;
+  const bool have_gpu_ms = gpu_snap && gpu_snap->command_buffers > 0;
+  const double gpu_ms_per_wall_s =
+      (window_s > 0.0 && have_gpu_ms)
+          ? (gpu_snap->gpu_ms_avg * static_cast<double>(gpu_cb_finished) / window_s)
+          : 0.0;
+
+  const auto emit_t0 = steady_clock::now();
+
+  if (have_gpu_ms) {
+    g_out << std::format(
+        R"({{"type":"summary","t_ms":{},"presents":{},"rendered":{},"presented":{},"unified_encode":{},"unified_fi":{},"fps_avg":{:.3f},"fps_min":{:.3f},"fps_max":{:.3f},"frame_ms_avg":{:.3f},"frame_ms_min":{:.3f},"frame_ms_max":{:.3f},"encode_prepare_ms_avg":{:.3f},"encode_flush_ms_avg":{:.3f},"commit_ms_avg":{:.3f},"present_latency_ms_avg":{:.3f},"scaler":{{"type":"{}","in_w":{},"in_h":{},"out_w":{},"out_h":{}}},"gpu_cb_finished":{},"gpu_ms_avg":{:.3f},"gpu_ms_min":{:.3f},"gpu_ms_max":{:.3f},"gpu_ms_per_wall_s":{:.3f},"gpu_ms_note":"Metal_GPUStartTime_to_GPUEndTime_per_finished_command_buffer_in_window","cpu_pct":null,"gpu_pct":null,"gpu_pct_note":"not_implemented_no_fabricated_gpu_pct"}})",
+        t_ms, counters.presents, counters.rendered, counters.presented,
+        counters.unified_encode, counters.unified_fi, fps_avg, fps_min, fps_max,
+        frame_ms_avg, frame_ms_min, frame_ms_max, encode_prepare_ms, encode_flush_ms,
+        commit_ms, present_latency_ms, scalerTypeName(info.type), info.input_width,
+        info.input_height, info.output_width, info.output_height, gpu_cb_finished,
+        gpu_snap->gpu_ms_avg, gpu_snap->gpu_ms_min, gpu_snap->gpu_ms_max, gpu_ms_per_wall_s
+    ) << '\n';
+  } else {
+    g_out << std::format(
+        R"({{"type":"summary","t_ms":{},"presents":{},"rendered":{},"presented":{},"unified_encode":{},"unified_fi":{},"fps_avg":{:.3f},"fps_min":{:.3f},"fps_max":{:.3f},"frame_ms_avg":{:.3f},"frame_ms_min":{:.3f},"frame_ms_max":{:.3f},"encode_prepare_ms_avg":{:.3f},"encode_flush_ms_avg":{:.3f},"commit_ms_avg":{:.3f},"present_latency_ms_avg":{:.3f},"scaler":{{"type":"{}","in_w":{},"in_h":{},"out_w":{},"out_h":{}}},"gpu_cb_finished":{},"gpu_ms_avg":null,"gpu_ms_min":null,"gpu_ms_max":null,"gpu_ms_per_wall_s":null,"gpu_ms_note":"Metal_GPUStartTime_to_GPUEndTime_per_finished_command_buffer_in_window","cpu_pct":null,"gpu_pct":null,"gpu_pct_note":"not_implemented_no_fabricated_gpu_pct"}})",
+        t_ms, counters.presents, counters.rendered, counters.presented,
+        counters.unified_encode, counters.unified_fi, fps_avg, fps_min, fps_max,
+        frame_ms_avg, frame_ms_min, frame_ms_max, encode_prepare_ms, encode_flush_ms,
+        commit_ms, present_latency_ms, scalerTypeName(info.type), info.input_width,
+        info.input_height, info.output_width, info.output_height, gpu_cb_finished
+    ) << '\n';
+  }
   g_out.flush();
 
-  WARN(
-      "perf-session: fps_avg=", std::format("{:.1f}", fps_avg),
-      " fps_min=", std::format("{:.1f}", fps_min),
-      " fps_max=", std::format("{:.1f}", fps_max),
-      " frame_ms=", std::format("{:.1f}", frame_ms_avg),
-      " encode=", std::format("{:.1f}+{:.1f}", encode_prepare_ms, encode_flush_ms),
-      " commit=", std::format("{:.1f}", commit_ms),
-      " present_lat=", std::format("{:.1f}", present_latency_ms)
-  );
+  const auto perf_log_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                               steady_clock::now() - emit_t0)
+                               .count();
+
+  if (have_gpu_ms) {
+    WARN(
+        "perf-session: fps_avg=", std::format("{:.1f}", fps_avg),
+        " fps_min=", std::format("{:.1f}", fps_min),
+        " fps_max=", std::format("{:.1f}", fps_max),
+        " frame_ms=", std::format("{:.1f}", frame_ms_avg),
+        " encode=", std::format("{:.1f}+{:.1f}", encode_prepare_ms, encode_flush_ms),
+        " commit=", std::format("{:.1f}", commit_ms),
+        " present_lat=", std::format("{:.1f}", present_latency_ms),
+        " gpu_ms=", std::format("{:.1f}", gpu_snap->gpu_ms_avg),
+        " gpu_cb=", gpu_cb_finished,
+        " perf_log_us=", perf_log_us
+    );
+  } else {
+    WARN(
+        "perf-session: fps_avg=", std::format("{:.1f}", fps_avg),
+        " fps_min=", std::format("{:.1f}", fps_min),
+        " fps_max=", std::format("{:.1f}", fps_max),
+        " frame_ms=", std::format("{:.1f}", frame_ms_avg),
+        " encode=", std::format("{:.1f}+{:.1f}", encode_prepare_ms, encode_flush_ms),
+        " commit=", std::format("{:.1f}", commit_ms),
+        " present_lat=", std::format("{:.1f}", present_latency_ms),
+        " perf_log_us=", perf_log_us
+    );
+  }
 
   resetWindowLocked(now);
 }
