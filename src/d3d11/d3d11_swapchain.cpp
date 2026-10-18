@@ -620,6 +620,7 @@ public:
       temporal_bound_motion_tex_ = nullptr;
       if (!unifiedSizeOk(desc_.Width, desc_.Height)) {
         temporal_inactive_below_size_ = true;
+        metalfx_spatial_scaler_ = nullptr;
         const UnifiedSizeLimits lim = unifiedSizeLimits();
         WARN(
             "unified-metalfx: ResizeBuffers ", desc_.Width, "x", desc_.Height,
@@ -637,11 +638,27 @@ public:
           ERR("unified-metalfx: interpolated backbuffer create failed");
           return E_FAIL;
         }
+        // Tip 21: SpatialScaler for estimate-input demote (color-only 4K) while
+        // TemporalScaler stays lazy for real depth/motion + FI.
+        if (device_->GetMTLDevice().supportsFXSpatialScaler()) {
+          WMTFXSpatialScalerInfo sinfo;
+          sinfo.input_height = desc_.Height;
+          sinfo.input_width = desc_.Width;
+          sinfo.output_height = desc_.Height * scale_factor;
+          sinfo.output_width = desc_.Width * scale_factor;
+          sinfo.color_format = backbuffer_->texture()->pixelFormat();
+          sinfo.output_format = upscaled_backbuffer_->texture()->pixelFormat();
+          metalfx_spatial_scaler_ = new SpatialScaler(device_->GetMTLDevice(), sinfo);
+        } else {
+          metalfx_spatial_scaler_ = nullptr;
+          WARN("unified-metalfx: FXSpatialScaler unsupported — estimate demote will present pre-upscale");
+        }
         WARN(
             "unified-metalfx: temporal upscale-only Present path armed (FI encode disabled until "
             "DXMT_METALFX_UNIFIED_FI=1) input=",
             desc_.Width, "x", desc_.Height, " output=", (uint32_t)(desc_.Width * scale_factor), "x",
-            (uint32_t)(desc_.Height * scale_factor)
+            (uint32_t)(desc_.Height * scale_factor),
+            " estimate_demote_spatial=", (bool)metalfx_spatial_scaler_
         );
       }
     }
@@ -936,6 +953,84 @@ public:
         temporal_inactive_below_size_ = true;
         MarkTemporalEncodeSkip("skip_reason=size_gate");
       }
+      const bool size_ok_for_encode = !temporal_inactive_below_size_;
+      // Tip 19/21: labeled estimates are not engine truth. Tip 21: demote to
+      // SpatialScaler color-only upscale (keep Picture scale) instead of paying
+      // TemporalScaler with zero MV / constant-far depth. Temporal+FI only when
+      // real depth/motion arrive — not spatial+sidecar (one Present owner).
+      const bool estimate_inputs =
+          present_dm::isLabeledEstimate(present_dm_depth_prov_) ||
+          present_dm::isLabeledEstimate(present_dm_motion_prov_);
+      if (estimate_inputs && size_ok_for_encode && upscaled_backbuffer_ && metalfx_spatial_scaler_) {
+        metalfx_temporal_scaler_ = nullptr;
+        metalfx_frame_interpolator_ = nullptr;
+        if (export_dm)
+          FlushPresentDmLog("spatial_encode=color_only_estimate_inputs");
+        LogTemporalEncodeStrategy("skip_reason=estimate_inputs_spatial_demote");
+        present_dm::logStep("present1:emitcc_spatial_demote_begin");
+        chunk->emitcc([
+          this, vsync_duration, backbuffer = backbuffer_->texture(),
+          sync_state = SyncFrame(++presentation_count_),
+          upscaled = upscaled_backbuffer_->texture(),
+          scaler = this->metalfx_spatial_scaler_, state = presenter->synchronizeLayerProperties()
+        ](ArgumentEncodingContext &ctx) mutable {
+          auto &scaler_info = ctx.currentFrameStatistics().last_scaler_info;
+          scaler_info.type = ScalerType::Spatial;
+          scaler_info.input_width = backbuffer->width();
+          scaler_info.input_height = backbuffer->height();
+          scaler_info.output_width = upscaled->width();
+          scaler_info.output_height = upscaled->height();
+          ctx.upscale(backbuffer, upscaled, scaler);
+          ctx.present(upscaled, presenter, vsync_duration, state.metadata);
+          present_dm::noteUnifiedTemporalPresent(upscaled->width(), upscaled->height());
+          const uint64_t n = present_dm::unifiedTemporalEncodeCount();
+          if (n == 1 || (n % 300u) == 0u) {
+            WARN(
+                "unified-metalfx: present_target=upscaled_spatial out=", upscaled->width(), "x",
+                upscaled->height(), " unified_temporal_encode_count=", n,
+                " (input=", backbuffer->width(), "x", backbuffer->height(),
+                " demote=estimate_inputs)"
+            );
+          }
+          ReleaseSemaphore(present_semaphore_, 1, nullptr);
+          this->UpdateStatistics(ctx.queue().statistics, ctx.currentFrameId());
+        });
+        present_dm::logStep("present1:emitcc_spatial_demote_queued");
+        rendered_present_count_++;
+        presented_present_count_++;
+        if ((rendered_present_count_ % 120u) == 0u) {
+          WARN(
+              "unified-metalfx: pacing rendered=", rendered_present_count_,
+              " presented=", presented_present_count_,
+              " unified_encode=", present_dm::unifiedTemporalEncodeCount(),
+              " last_out=", present_dm::lastUnifiedPresentWidth(), "x",
+              present_dm::lastUnifiedPresentHeight(),
+              " interp=off_estimate_spatial depth_bind=ESTIMATE_DEPTH_CONSTANT_FAR"
+          );
+        }
+      } else if (estimate_inputs && size_ok_for_encode) {
+        metalfx_temporal_scaler_ = nullptr;
+        metalfx_frame_interpolator_ = nullptr;
+        if (export_dm)
+          FlushPresentDmLog("spatial_encode=skip_reason=spatial_scaler_missing");
+        WARN(
+            "unified-metalfx: estimate_inputs but SpatialScaler missing — "
+            "presenting pre-upscale backbuffer"
+        );
+        present_dm::logStep("present1:emitcc_pre_upscale_begin");
+        chunk->emitcc([
+          this, vsync_duration, state = presenter->synchronizeLayerProperties(),
+          sync_state = SyncFrame(++presentation_count_),
+          backbuffer = backbuffer_->texture()
+        ](ArgumentEncodingContext &ctx) mutable {
+          ctx.present(backbuffer, presenter, vsync_duration, state.metadata);
+          ReleaseSemaphore(present_semaphore_, 1, nullptr);
+          this->UpdateStatistics(ctx.queue().statistics, ctx.currentFrameId());
+        });
+        present_dm::logStep("present1:emitcc_pre_upscale_queued");
+        rendered_present_count_++;
+        presented_present_count_++;
+      } else {
       Rc<Texture> depth_tex = present_depth_ ? present_depth_->texture() : nullptr;
       Rc<Texture> motion_tex = present_motion_ ? present_motion_->texture() : nullptr;
       const bool prev_valid = present_prev_color_valid_ && present_prev_color_;
@@ -945,7 +1040,6 @@ public:
       // Depth must be bindable R32Float/Depth32Float — never encode with Invalid/D32S8.
       // Upscale-only boot: interpolated_backbuffer_ is reserved for opt-in FI; temporal
       // encode only needs scaler + upscaled backbuffer.
-      const bool size_ok_for_encode = !temporal_inactive_below_size_;
       const bool bindings_ok = size_ok_for_encode && depth_tex && motion_tex &&
                                depth_bind_fmt != WMTPixelFormatInvalid && upscaled_backbuffer_;
       // Ensure may (re)create scaler — Creating phase skips encode (crash F).
@@ -988,17 +1082,11 @@ public:
       const bool fi_gate = UnifiedFiEncodeEnabled();
       const char *fi_skip = nullptr;
       bool have_interp = false;
-      const bool estimate_inputs =
-          present_dm::isLabeledEstimate(present_dm_depth_prov_) ||
-          present_dm::isLabeledEstimate(present_dm_motion_prov_);
       if (!fi_gate) {
         metalfx_frame_interpolator_ = nullptr;
         fi_skip = "skip_reason=disabled_until_DXMT_METALFX_UNIFIED_FI";
       } else if (!encoded) {
         fi_skip = "skip_reason=temporal_bind_unsafe";
-      } else if (estimate_inputs) {
-        metalfx_frame_interpolator_ = nullptr;
-        fi_skip = "skip_reason=estimate_inputs";
       } else if (guard_phase_ != TemporalGuardPhase::Stable) {
         fi_skip = "skip_reason=awaiting_guard_stable";
       } else if (!prev_valid) {
@@ -1195,6 +1283,7 @@ public:
           );
         }
       }
+      } // tip-21: else real depth/motion → temporal(+FI) path
     } else {
       present_dm::logStep("present1:emitcc_off_begin");
       chunk->emitcc([
@@ -2352,7 +2441,8 @@ private:
 
   bool handle_alt_tab_;
 
-  std::conditional_t<kSpatial, Rc<SpatialScaler>, std::monostate> metalfx_spatial_scaler_;
+  /** Spatial scaler: Picture path (kSpatial) + tip-21 estimate demote (kTemporal). */
+  std::conditional_t<kUpscale, Rc<SpatialScaler>, std::monostate> metalfx_spatial_scaler_;
   std::conditional_t<kTemporal, Rc<TemporalScaler>, std::monostate> metalfx_temporal_scaler_;
   std::conditional_t<kTemporal, Rc<FrameInterpolator>, std::monostate> metalfx_frame_interpolator_;
   std::conditional_t<kUpscale, Com<D3D11ResourceCommon>, std::monostate> upscaled_backbuffer_;
