@@ -97,6 +97,7 @@ constexpr const char *kMotionUnavailable = "REAL_MOTION_UNAVAILABLE";
 constexpr const char *kDepthOmAtPresent = "REAL_DEPTH_OM_AT_PRESENT";
 constexpr const char *kDepthTracked = "REAL_DEPTH_TRACKED";
 constexpr const char *kDepthTitleTemporal = "REAL_DEPTH_TITLE_TEMPORAL";
+constexpr const char *kDepthResolvedD32S8 = "REAL_DEPTH_RESOLVED_D32S8";
 constexpr const char *kDepthMissing = "REAL_DEPTH_MISSING";
 constexpr const char *kMotionTitle = "REAL_MOTION_TITLE_TEMPORAL";
 

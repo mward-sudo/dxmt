@@ -388,6 +388,58 @@ MTLFXMVScaleContext::dispatch(
   ctx_.endPass();
 }
 
+MetalFXDepthResolveContext::MetalFXDepthResolveContext(
+    WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx
+) :
+    ctx_(ctx),
+    device_(device) {
+  WMT::Reference<WMT::Error> err;
+  auto library = lib.getLibrary();
+  auto cs_ = library.newFunction("cs_resolve_d32s8_depth_to_r32");
+  pso_resolve_d32s8_depth_ = device_.newComputePipelineState(cs_, err);
+  if (err) {
+    ERR("MetalFXDepthResolveContext: failed to create cs_resolve_d32s8_depth_to_r32 PSO: ",
+        err.description().getUTF8String());
+    pso_resolve_d32s8_depth_ = nullptr;
+  }
+}
+
+bool
+MetalFXDepthResolveContext::dispatch(
+    const Rc<Texture> &src, TextureViewKey src_view, const Rc<Texture> &dst, TextureViewKey dst_view
+) {
+  if (!pso_resolve_d32s8_depth_ || !src || !dst)
+    return false;
+
+  ctx_.startComputePass(0);
+  auto tex_src = ctx_.access(src, src_view, ResourceAccess::Read).texture;
+  auto tex_dst = ctx_.access(dst, dst_view, ResourceAccess::Write).texture;
+
+  auto &setpso = ctx_.encodeComputeCommand<wmtcmd_compute_setpso>();
+  setpso.type = WMTComputeCommandSetPSO;
+  setpso.pso = pso_resolve_d32s8_depth_;
+  setpso.threadgroup_size = {8, 4, 1};
+
+  auto &setsrc = ctx_.encodeComputeCommand<wmtcmd_compute_settexture>();
+  setsrc.type = WMTComputeCommandSetTexture;
+  setsrc.texture = tex_src;
+  setsrc.index = 0;
+
+  auto &setdst = ctx_.encodeComputeCommand<wmtcmd_compute_settexture>();
+  setdst.type = WMTComputeCommandSetTexture;
+  setdst.texture = tex_dst;
+  setdst.index = 1;
+
+  auto width = dst->width(dst_view);
+  auto height = dst->height(dst_view);
+  auto &dispatch = ctx_.encodeComputeCommand<wmtcmd_compute_dispatch>();
+  dispatch.type = WMTComputeCommandDispatchThreads;
+  dispatch.size = {width, height, 1};
+
+  ctx_.endPass();
+  return true;
+}
+
 TileBarrierContext::TileBarrierContext(WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx) :
     ctx_(ctx),
     device_(device) {

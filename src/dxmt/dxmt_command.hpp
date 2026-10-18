@@ -240,6 +240,22 @@ private:
   WMT::Reference<WMT::ComputePipelineState> pso_downscale_dilated_mv_;
 };
 
+class MetalFXDepthResolveContext {
+public:
+  MetalFXDepthResolveContext(WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx);
+
+  bool ready() const { return (bool)pso_resolve_d32s8_depth_; }
+
+  bool dispatch(
+      const Rc<Texture> &src, TextureViewKey src_view, const Rc<Texture> &dst, TextureViewKey dst_view
+  );
+
+private:
+  ArgumentEncodingContext &ctx_;
+  WMT::Device device_;
+  WMT::Reference<WMT::ComputePipelineState> pso_resolve_d32s8_depth_;
+};
+
 constexpr auto kBarrierTileSize = 16;
 
 class TileBarrierContext {

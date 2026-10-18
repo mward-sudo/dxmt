@@ -862,6 +862,7 @@ public:
   DepthStencilBlitContext blit_depth_stencil_cmd;
   ClearUAV<ArgumentEncodingContext> clear_uav_cmd;
   MTLFXMVScaleContext mv_scale_cmd;
+  MetalFXDepthResolveContext depth_resolve_cmd;
   TileBarrierContext tile_barrier_cmd;
 
 private:

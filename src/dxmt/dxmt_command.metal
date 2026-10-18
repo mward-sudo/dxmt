@@ -650,6 +650,15 @@ struct DXMTClearUintMetadata {
   downscaled.write(lo_mv_pixel.xyxy, pos); 
 }
 
+[[kernel]] void cs_resolve_d32s8_depth_to_r32(
+  ushort2 pos [[thread_position_in_grid]],
+  texture2d<float, access::read>  depth_src [[texture(0)]],
+  texture2d<float, access::write> depth_dst [[texture(1)]]
+) {
+  if (pos.x < depth_dst.get_width() && pos.y < depth_dst.get_height())
+    depth_dst.write(float4(depth_src.read(pos).x), pos);
+}
+
 [[kernel]] void tile_barrier(ushort2 pos [[thread_position_in_threadgroup]]) {
   // empty
 }

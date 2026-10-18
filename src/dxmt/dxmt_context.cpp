@@ -37,6 +37,7 @@ ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Devic
     blit_depth_stencil_cmd(device, lib, *this),
     clear_uav_cmd(device, *this),
     mv_scale_cmd(device, lib, *this),
+    depth_resolve_cmd(device, lib, *this),
     tile_barrier_cmd(device, lib, *this),
     timestamp_state_(device),
     queue_(queue) {

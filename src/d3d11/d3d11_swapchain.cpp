@@ -567,6 +567,8 @@ public:
     present_prev_color_ = nullptr;
     present_depth_ = nullptr;
     present_motion_ = nullptr;
+    depth_resolve_target_ = nullptr;
+    depth_resolve_src_ = nullptr;
     present_prev_color_valid_ = false;
     if (present_dm::enabled())
       EnsurePresentPrevColorTexture();
@@ -606,6 +608,9 @@ public:
       temporal_motion_format_ = WMTPixelFormatInvalid;
       temporal_needs_reset_ = true;
       d32s8_unsuitable_depth_seen_ = false;
+      depth_resolve_pending_ = false;
+      depth_resolve_failed_ = false;
+      depth_resolve_promoted_ = false;
       guard_phase_ = TemporalGuardPhase::Uninitialised;
       guard_cooldown_remaining_ = 0;
       guard_cooldown_reason_.clear();
@@ -937,7 +942,10 @@ public:
         temporal_inactive_below_size_ = true;
         MarkTemporalEncodeSkip("skip_reason=size_gate");
       }
-      Rc<Texture> depth_tex = present_depth_ ? present_depth_->texture() : nullptr;
+      Rc<Texture> depth_tex =
+          depth_resolve_pending_ && depth_resolve_target_
+              ? depth_resolve_target_
+              : (present_depth_ ? present_depth_->texture() : nullptr);
       Rc<Texture> motion_tex = present_motion_ ? present_motion_->texture() : nullptr;
       const bool prev_valid = present_prev_color_valid_ && present_prev_color_;
       Rc<Texture> prev_color_tex = prev_valid ? present_prev_color_->texture() : nullptr;
@@ -1048,7 +1056,11 @@ public:
         const uint32_t content_w = backbuffer_desc_.Width;
         const uint32_t content_h = backbuffer_desc_.Height;
         const double half_vsync = vsync_duration * 0.5;
-        const bool depth_is_estimate = depth_bind_fmt == WMTPixelFormatR32Float;
+        const bool depth_is_estimate =
+            present_dm::isLabeledEstimate(present_dm_depth_prov_);
+        const bool do_resolve = depth_resolve_pending_;
+        Rc<Texture> resolve_src = do_resolve ? depth_resolve_src_ : Rc<Texture>{};
+        Rc<Texture> resolve_dst = do_resolve ? depth_resolve_target_ : Rc<Texture>{};
         // Capture Rc/scaler by value at emit time so a later Present recreate
         // cannot leave the queued encode holding a stale FI/scaler pointer.
         present_dm::logStep("present1:emitcc_temporal_begin");
@@ -1061,6 +1073,8 @@ public:
                              : Rc<Texture>{},
           depth = std::move(depth_tex), motion = std::move(motion_tex),
           prev_color = std::move(prev_color_tex),
+          resolve_src = std::move(resolve_src), resolve_dst = std::move(resolve_dst),
+          do_resolve,
           scaler = this->metalfx_temporal_scaler_,
           interpolator = have_interp ? this->metalfx_frame_interpolator_ : Rc<FrameInterpolator>{},
           motion_format = temporal_motion_format_, depth_bind_fmt, reset, content_w, content_h,
@@ -1119,6 +1133,15 @@ public:
           props.jitter_offset_x = 0.f;
           props.jitter_offset_y = 0.f;
           props.pre_exposure = 1.f;
+          if (do_resolve) {
+            if (!resolve_src || !resolve_dst ||
+                !ctx.depth_resolve_cmd.dispatch(
+                    resolve_src, resolve_src->fullView, resolve_dst, resolve_dst->fullView
+                )) {
+              WARN("unified-metalfx: depth_resolve=dispatch_failed — sticky demote next Present");
+              this->depth_resolve_failed_ = true;
+            }
+          }
           // One pipeline: temporal upscale → frame interpolate → Presenter.
           // Colocation: if FI cannot safely encode, fall back to temporal-upscale-only.
           ctx.upscaleTemporal(
@@ -1209,6 +1232,10 @@ public:
       });
       present_dm::logStep("present1:emitcc_off_queued");
     }
+    // Clear per-Present resolve staging so a skipped Present cannot pin a stale source.
+    depth_resolve_pending_ = false;
+    depth_resolve_src_ = nullptr;
+
     // Defer prev-color history until after emitcc so GPU encode order is:
     // FrameInterpolate(reads prev) → CopyResource(prev ← current) for next tick.
     if (export_dm) {
@@ -1742,6 +1769,58 @@ private:
     return env::getEnvVar("DXMT_METALFX_UNIFIED_FI") == "1";
   }
 
+  /** Tip 26: D32S8→R32Float resolve is default-on; kill with DXMT_METALFX_DEPTH_RESOLVE=0. */
+  static bool DepthResolveEnabled() {
+    return env::getEnvVar("DXMT_METALFX_DEPTH_RESOLVE") != "0";
+  }
+
+  static bool MetalDepthResolvable(WMTPixelFormat fmt) {
+    return fmt == WMTPixelFormatDepth32Float_Stencil8 || fmt == WMTPixelFormatR32X8X32;
+  }
+
+  bool EnsureDepthResolveTarget() {
+    const uint32_t w = backbuffer_desc_.Width;
+    const uint32_t h = backbuffer_desc_.Height;
+    if (!w || !h)
+      return false;
+    if (depth_resolve_target_ && depth_resolve_target_->width() == w &&
+        depth_resolve_target_->height() == h &&
+        depth_resolve_target_->pixelFormat() == WMTPixelFormatR32Float)
+      return true;
+    WMTTextureInfo tex_info{};
+    tex_info.width = w;
+    tex_info.height = h;
+    tex_info.depth = 1;
+    tex_info.array_length = 1;
+    tex_info.mipmap_level_count = 1;
+    tex_info.pixel_format = WMTPixelFormatR32Float;
+    tex_info.sample_count = 1;
+    tex_info.type = WMTTextureType2D;
+    tex_info.usage = WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite;
+    tex_info.options = WMTResourceStorageModePrivate;
+    Rc<Texture> tex = new Texture(tex_info, device_->GetMTLDevice());
+    if (!tex)
+      return false;
+    Flags<TextureAllocationFlag> flags;
+    flags.set(TextureAllocationFlag::GpuPrivate);
+    tex->rename(tex->allocate(flags));
+    depth_resolve_target_ = std::move(tex);
+    return (bool)depth_resolve_target_;
+  }
+
+  void LogDepthResolveStrategy(const std::string &tag) {
+    if (last_depth_resolve_log_ == tag)
+      return;
+    last_depth_resolve_log_ = tag;
+    WARN("unified-metalfx: depth_resolve=", tag.c_str());
+  }
+
+  void LogDepthResolveStrategy(const char *tag) {
+    if (!tag)
+      return;
+    LogDepthResolveStrategy(std::string(tag));
+  }
+
   /** Tip 17: Uninitialised → Cooldown(n) → Creating → Stable (one log / transition). */
   enum class TemporalGuardPhase : uint8_t {
     Uninitialised = 0,
@@ -2126,7 +2205,50 @@ private:
       // destroy the live R32Float estimate (format mismatch), then Fill would
       // allocate a new estimate while scaler/FI stay on depth_fmt=55 without
       // reset — MetalFX encode then page-faults (live crash C / D).
-      if (DxgiDepthUnsuitableForMetalFX(depth_fmt)) {
+      // Tip 26: prefer dedicated R32Float resolve before the tip-14 soft path.
+      bool took_depth_resolve = false;
+      if constexpr (kTemporal) {
+        Rc<Texture> src_tex = depth_src ? GetTexture(depth_src.ptr()) : nullptr;
+        const WMTPixelFormat src_metal =
+            src_tex ? src_tex->pixelFormat() : WMTPixelFormatInvalid;
+        const bool resolve_enabled = DepthResolveEnabled();
+        const bool resolve_fmt_ok = MetalDepthResolvable(src_metal);
+        if (resolve_enabled && resolve_fmt_ok && !depth_resolve_failed_) {
+          auto &enc = device_->GetDXMTDevice().queue().argument_encoding_ctx;
+          if (!enc.depth_resolve_cmd.ready()) {
+            LogDepthResolveStrategy("skip_reason=pso_nil");
+          } else if (!EnsureDepthResolveTarget()) {
+            LogDepthResolveStrategy("skip_reason=alloc_failed");
+          } else {
+            depth_prov = present_dm::kDepthResolvedD32S8;
+            depth_fmt = DXGI_FORMAT_R32_FLOAT;
+            need_estimate_depth = false;
+            depth_resolve_src_ = std::move(src_tex);
+            depth_resolve_pending_ = true;
+            took_depth_resolve = true;
+            // Successful resolve is not an unsuitable transition — leave latch alone.
+            if (!depth_resolve_promoted_) {
+              depth_resolve_promoted_ = true;
+              OnMetalFXDepthOrMotionIdentityChanged("depth_resolved_promote");
+            }
+            LogDepthResolveStrategy(std::format(
+                "ok src_fmt={} dst_fmt={} {}x{}", (uint32_t)src_metal,
+                (uint32_t)WMTPixelFormatR32Float, backbuffer_desc_.Width,
+                backbuffer_desc_.Height
+            ));
+          }
+        } else if (resolve_enabled && resolve_fmt_ok && depth_resolve_failed_) {
+          LogDepthResolveStrategy("skip_reason=failed_sticky");
+        } else if (resolve_enabled && DxgiDepthUnsuitableForMetalFX(depth_fmt) &&
+                   !resolve_fmt_ok) {
+          LogDepthResolveStrategy("skip_reason=src_fmt");
+        } else if (!resolve_enabled && DxgiDepthUnsuitableForMetalFX(depth_fmt)) {
+          LogDepthResolveStrategy("skip_reason=disabled");
+        }
+      }
+      if (took_depth_resolve) {
+        present_dm::logStep("export:depth_resolve_pending");
+      } else if (DxgiDepthUnsuitableForMetalFX(depth_fmt)) {
         present_dm::logStep("export:depth_unsuitable_d32s8");
         // Tip 14: one transition WARN; subsequent ticks are step-only (or VERBOSE).
         if (!d32s8_unsuitable_depth_seen_ || present_dm::verbose()) {
@@ -2217,7 +2339,8 @@ private:
     }
 
     // Real depth missing / unsuitable → labeled constant-far estimate (only after real failure).
-    if (need_estimate_depth || !present_depth_) {
+    // Tip 26 resolve binds depth_resolve_target_; do not clobber REAL_DEPTH_RESOLVED_D32S8.
+    if ((need_estimate_depth || !present_depth_) && !depth_resolve_pending_) {
       present_dm::logStep("export:estimate_depth_fill_begin");
       if (!FillLabeledDepthEstimateConstantFar(&depth_prov, &depth_fmt)) {
         present_depth_ = nullptr;
@@ -2347,6 +2470,12 @@ private:
   Com<D3D11ResourceCommon, false> present_prev_color_;
   Com<D3D11ResourceCommon, false> present_depth_;
   Com<D3D11ResourceCommon, false> present_motion_;
+  /** Tip 26: dedicated dxmt-owned R32Float resolve target (not present_depth_). */
+  Rc<Texture> depth_resolve_target_;
+  Rc<Texture> depth_resolve_src_;
+  bool depth_resolve_pending_ = false;
+  bool depth_resolve_failed_ = false;
+  bool depth_resolve_promoted_ = false;
   bool present_prev_color_valid_ = false;
   HANDLE present_semaphore_;
   std::unique_ptr<CpuFence> frame_latency_fence_;
@@ -2413,6 +2542,7 @@ private:
   std::string last_encode_bind_log_;
   std::string last_fi_encode_log_;
   std::string last_temporal_encode_log_;
+  std::string last_depth_resolve_log_;
   /** Deferred present-dm log until temporal encode/skip decision (honest label). */
   bool present_dm_log_pending_ = false;
   bool present_dm_prev_valid_ = false;
