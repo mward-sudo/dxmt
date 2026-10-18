@@ -25,6 +25,7 @@
 #include "dxmt_info.hpp"
 #include "dxmt_presenter.hpp"
 #include "present_depth_motion.hpp"
+#include "perf_session.hpp"
 #include <atomic>
 #include <cfloat>
 #include <cstdlib>
@@ -1232,6 +1233,18 @@ public:
     present_dm::logStep("present1:present_boundary_begin");
     cmd_queue.PresentBoundary();
     present_dm::logStep("present1:present_boundary_end");
+
+    if (perf_session::enabled()) {
+      perf_session::PresentCounters perf{};
+      perf.presents = presentation_count_;
+      perf.rendered = rendered_present_count_;
+      perf.presented = presented_present_count_;
+      perf.unified_encode = present_dm::unifiedTemporalEncodeCount();
+      perf.unified_fi = present_dm::unifiedFiPresentCount();
+      perf_session::onPresent(
+          perf, cmd_queue.statistics, cmd_queue.GetPresentFrameCount()
+      );
+    }
 
     return hr;
   };

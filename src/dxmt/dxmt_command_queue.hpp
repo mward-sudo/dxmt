@@ -253,6 +253,12 @@ public:
     return frame_count + 1;
   }
 
+  /** `frame_count` after `PresentBoundary()` (private counter accessor). */
+  uint64_t
+  GetPresentFrameCount() const {
+    return frame_count;
+  }
+
   FrameStatistics& CurrentFrameStatistics() {
     return statistics.at(frame_count);
   }

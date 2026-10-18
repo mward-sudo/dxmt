@@ -10,6 +10,7 @@ d3d11_src = [
   'd3d11_state_object.cpp',
   'd3d11_swapchain.cpp',
   'present_depth_motion.cpp',
+  'perf_session.cpp',
   'd3d11_texture.cpp',
   'd3d11_buffer.cpp',
   'd3d11.cpp',
