@@ -1912,11 +1912,14 @@ private:
     temporal_bound_depth_tex_ = nullptr;
     temporal_bound_motion_tex_ = nullptr;
     if constexpr (kTemporal) {
-      // Same class as crash G: destroy then immediate Ensure create is unsafe.
-      BeginMetalFXScalerDestroyCooldown("skip_reason=identity_destroy_cooldown");
       std::string skip = std::string("skip_reason=identity_changed:") + (reason ? reason : "unknown");
       MarkTemporalEncodeSkip(skip.c_str());
       LogFiEncodeStrategy(skip);
+      // Tip 14: cooldown with a null scaler only delays first Ensure (crash H class).
+      // Destroy+cooldown only when a live TemporalScaler would be recreated immediately.
+      if (metalfx_temporal_scaler_) {
+        BeginMetalFXScalerDestroyCooldown("skip_reason=identity_destroy_cooldown");
+      }
     }
   }
 
@@ -2036,35 +2039,49 @@ private:
       // reset — MetalFX encode then page-faults (live crash C / D).
       if (DxgiDepthUnsuitableForMetalFX(depth_fmt)) {
         present_dm::logStep("export:depth_unsuitable_d32s8");
-        WARN(
-            "unified-metalfx: real depth DXGI fmt=", (uint32_t)depth_fmt,
-            " (D32S8/unsuitable) — skip copy; keep/reuse labeled R32Float "
-            "ESTIMATE_DEPTH_CONSTANT_FAR for bind"
-        );
-        // Transition into unsuitable real depth: force temporal reset + streak=0
-        // even when the owned R32 estimate texture id is unchanged (crash E).
+        // Tip 14: one transition WARN; subsequent ticks are step-only (or VERBOSE).
+        if (!d32s8_unsuitable_depth_seen_ || present_dm::verbose()) {
+          WARN(
+              "unified-metalfx: real depth DXGI fmt=", (uint32_t)depth_fmt,
+              " (D32S8/unsuitable) — skip copy; keep/reuse labeled R32Float "
+              "ESTIMATE_DEPTH_CONSTANT_FAR for bind"
+          );
+        }
+        // First sighting: keep/reuse R32 estimate. Destroy+cooldown only when a
+        // live scaler was binding non-estimate (real) depth — MetalFX never binds
+        // D32S8, so estimate-already / scaler-null must not fake a transition.
         if (!d32s8_unsuitable_depth_seen_) {
           d32s8_unsuitable_depth_seen_ = true;
-          temporal_needs_reset_ = true;
-          metalfx_stable_present_streak_ = 0;
-          metalfx_stable_depth_tex_ = nullptr;
-          metalfx_stable_motion_tex_ = nullptr;
-          metalfx_stable_scaler_ = nullptr;
-          metalfx_stable_fi_ = nullptr;
+          bool hard_destroy = false;
           if constexpr (kTemporal) {
-            // Crash F: destroy TemporalScaler on unsuitable transition — never
-            // encode across this Present; present pre-upscale backbuffer instead.
-            // Crash G: also withhold Ensure/create for N Presents (no immediate recreate).
-            BeginMetalFXScalerDestroyCooldown("skip_reason=d32s8_cooldown");
-            MarkTemporalEncodeSkip("skip_reason=d32s8_transition");
-            LogTemporalEncodeStrategy("skip_reason=d32s8_transition");
+            hard_destroy = (bool)metalfx_temporal_scaler_ &&
+                           !IsReusableEstimateDepthSlot(present_depth_);
           }
-          LogFiEncodeStrategy("skip_reason=d32s8_unsuitable_transition");
-          WARN(
-              "unified-metalfx: D32S8 unsuitable transition — TemporalScaler destroyed; "
-              "encode skipped; recreate cooldown=",
-              kMetalFXScalerRecreateCooldownPresents, " Presents; streak cleared"
-          );
+          if (hard_destroy) {
+            temporal_needs_reset_ = true;
+            metalfx_stable_present_streak_ = 0;
+            metalfx_stable_depth_tex_ = nullptr;
+            metalfx_stable_motion_tex_ = nullptr;
+            metalfx_stable_scaler_ = nullptr;
+            metalfx_stable_fi_ = nullptr;
+            if constexpr (kTemporal) {
+              // Crash F/G: real→unsuitable with a live scaler — destroy + withhold.
+              BeginMetalFXScalerDestroyCooldown("skip_reason=d32s8_cooldown");
+              MarkTemporalEncodeSkip("skip_reason=d32s8_transition");
+              LogTemporalEncodeStrategy("skip_reason=d32s8_transition");
+            }
+            LogFiEncodeStrategy("skip_reason=d32s8_unsuitable_transition");
+            WARN(
+                "unified-metalfx: D32S8 unsuitable transition — TemporalScaler destroyed; "
+                "encode skipped; recreate cooldown=",
+                kMetalFXScalerRecreateCooldownPresents, " Presents; streak cleared"
+            );
+          } else {
+            WARN(
+                "unified-metalfx: D32S8 unsuitable — keeping labeled R32 estimate; "
+                "TemporalScaler left intact (no destroy/cooldown)"
+            );
+          }
         }
         depth_prov = present_dm::kDepthMissing;
         need_estimate_depth = true;
