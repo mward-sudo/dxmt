@@ -821,6 +821,10 @@ public:
       override {
     std::lock_guard<mutex_t> lock(mutex);
 
+    if (present_dm::mvProbeEnabled()) [[unlikely]] {
+      if (device->GetImmediateContextPrivate() == static_cast<IMTLD3D11DeviceContext *>(this))
+        present_dm::noteSceneDepthClear(pDepthStencilView, ClearFlags, Depth);
+    }
     ClearDepthStencilView(static_cast<D3D11DepthStencilView*>(pDepthStencilView), ClearFlags, Depth, Stencil);
   }
 
@@ -2878,19 +2882,20 @@ public:
           OMResolveSRVHazard(dsv);
         }
         // present-dm: remember scene depth while bound (often unbound by Present).
-        if (device->GetImmediateContextPrivate() == static_cast<IMTLD3D11DeviceContext *>(this)) {
+        if (device->GetImmediateContextPrivate() == static_cast<IMTLD3D11DeviceContext *>(this))
           present_dm::trackSceneDepth(dsv);
-          if (present_dm::mvProbeEnabled()) [[unlikely]] {
-            present_dm::noteRenderTargetBind(
-                ppRenderTargetViews, NumRTVs, pDepthStencilView
-            );
-          }
-        }
       } else {
         if (state_.OutputMerger.DSV) {
           should_invalidate_pass = true;
         }
         state_.OutputMerger.DSV = nullptr;
+      }
+      if (device->GetImmediateContextPrivate() == static_cast<IMTLD3D11DeviceContext *>(this)) {
+        if (present_dm::mvProbeEnabled()) [[unlikely]] {
+          present_dm::noteRenderTargetBind(
+              ppRenderTargetViews, NumRTVs, pDepthStencilView
+          );
+        }
       }
     }
 
@@ -3043,6 +3048,13 @@ public:
   OMSetDepthStencilState(ID3D11DepthStencilState *pDepthStencilState, UINT StencilRef) override {
     std::lock_guard<mutex_t> lock(mutex);
 
+    if (present_dm::mvProbeEnabled()) [[unlikely]] {
+      present_dm::noteDepthStencilState(
+          pDepthStencilState,
+          state_.OutputMerger.DSV ? state_.OutputMerger.DSV.ptr() : nullptr,
+          static_cast<ID3D11Device *>(device)
+      );
+    }
     if (auto expected = com_cast<IMTLD3D11DepthStencilState>(pDepthStencilState)) {
       state_.OutputMerger.DepthStencilState = expected.ptr();
     } else {
@@ -4874,20 +4886,42 @@ public:
   DrawCallStatus
   PreDraw() {
     if (present_dm::mvProbeArmBActive()) [[unlikely]] {
-      present_dm::MvProbeCbSlot slots[14]{};
-      auto &cbs = state_.ShaderStages[PipelineStage::Vertex].ConstantBuffers;
+      present_dm::MvProbeCbSlot vs_slots[14]{};
+      auto &vs_cbs = state_.ShaderStages[PipelineStage::Vertex].ConstantBuffers;
       for (UINT slot = 0; slot < 14; slot++) {
-        if (!cbs.test_bound(slot))
+        if (!vs_cbs.test_bound(slot))
           continue;
-        auto &entry = cbs[slot];
+        auto &entry = vs_cbs[slot];
         if (!entry.Buffer)
           continue;
-        slots[slot].buffer = entry.Buffer.ptr();
-        slots[slot].first_constant = entry.FirstConstant;
-        slots[slot].num_constants = entry.NumConstants;
+        vs_slots[slot].buffer = entry.Buffer.ptr();
+        vs_slots[slot].first_constant = entry.FirstConstant;
+        vs_slots[slot].num_constants = entry.NumConstants;
+      }
+      present_dm::MvProbeCbSlot ps_slots[14]{};
+      const present_dm::MvProbeCbSlot *ps_ptr = nullptr;
+      if (present_dm::mvProbeCbPsEnabled()) {
+        auto &ps_cbs = state_.ShaderStages[PipelineStage::Pixel].ConstantBuffers;
+        for (UINT slot = 0; slot < 14; slot++) {
+          if (!ps_cbs.test_bound(slot))
+            continue;
+          auto &entry = ps_cbs[slot];
+          if (!entry.Buffer)
+            continue;
+          ps_slots[slot].buffer = entry.Buffer.ptr();
+          ps_slots[slot].first_constant = entry.FirstConstant;
+          ps_slots[slot].num_constants = entry.NumConstants;
+        }
+        ps_ptr = ps_slots;
+      }
+      float vp_min = 0.0f;
+      float vp_max = 1.0f;
+      if (state_.Rasterizer.NumViewports > 0) {
+        vp_min = state_.Rasterizer.viewports[0].MinDepth;
+        vp_max = state_.Rasterizer.viewports[0].MaxDepth;
       }
       present_dm::noteSceneDrawForMvProbe(
-          static_cast<ID3D11Device *>(device), slots
+          static_cast<ID3D11Device *>(device), vs_slots, ps_ptr, vp_min, vp_max
       );
     }
     DrawCallStatus status;

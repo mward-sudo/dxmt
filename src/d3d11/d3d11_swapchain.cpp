@@ -563,6 +563,7 @@ public:
     backbuffer_->AddRefPrivate();
     backbuffer_->Release();
 
+    present_dm::releaseMvProbeReadback(device_);
     // present-dm: reset history on resize
     present_prev_color_ = nullptr;
     present_depth_ = nullptr;
@@ -2457,14 +2458,30 @@ private:
     if (present_dm::mvProbeEnabled()) [[unlikely]] {
       const uint64_t present_n = presentation_count_ + 1;
       const uint32_t period = present_dm::mvProbePeriod();
+      uint32_t probe_log_emitted = 0;
       if (period != 0 && present_n % period == 0) {
         last_mv_probe_log_.clear();
         present_dm::logMvProbeCensus(present_n);
-        const uint32_t n = present_dm::mvProbePreparedLogCount();
-        for (uint32_t i = 0; i < n; i++) {
+        probe_log_emitted = present_dm::mvProbePreparedLogCount();
+        for (uint32_t i = 0; i < probe_log_emitted; i++) {
           if (const char *line = present_dm::mvProbePreparedLogAt(i))
             LogMvProbeStrategy(line);
         }
+      }
+      if (present_dm::mvReadbackEnabled()) {
+        present_dm::noteMvReadbackTick(
+            device_, device_context_, present_n, backbuffer_desc_.Width,
+            backbuffer_desc_.Height
+        );
+        const uint32_t rb_n = present_dm::mvProbePreparedLogCount();
+        for (uint32_t i = probe_log_emitted; i < rb_n; i++) {
+          if (const char *line = present_dm::mvProbePreparedLogAt(i))
+            LogMvProbeStrategy(line);
+        }
+        if (rb_n > probe_log_emitted)
+          present_dm::mvProbeClearPreparedLogs();
+      } else if (probe_log_emitted != 0) {
+        present_dm::mvProbeClearPreparedLogs();
       }
       present_dm::noteMvProbePresent(present_n);
     }

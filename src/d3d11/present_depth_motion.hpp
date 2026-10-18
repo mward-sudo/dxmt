@@ -77,6 +77,8 @@ void trackSceneDepth(ID3D11DepthStencilView *dsv);
 bool mvProbeEnabled();
 /** True during a sampled Present while Arm B may still scan draws. */
 bool mvProbeArmBActive();
+/** Optional PS-stage CB scan (`DXMT_MV_PROBE_CB_PS`, default off). */
+bool mvProbeCbPsEnabled();
 /** Presents between census dumps; `DXMT_MV_PROBE_PERIOD`, default 600. */
 uint32_t mvProbePeriod();
 /** Arm A: aggregate RTV binds at OMSetRenderTargets (desc metadata only). */
@@ -84,17 +86,38 @@ void noteRenderTargetBind(
     ID3D11RenderTargetView *const *rtvs, UINT num_rtvs, ID3D11DepthStencilView *dsv
 );
 /**
- * Arm B: structural VS CB projection scan. Call from PreDraw with bound VS CB
- * slots; scans at most the first 2 draws after scene DSV in a sampled Present.
+ * Arm B/B′: structural VS (and optional PS) CB projection scan. Call from
+ * PreDraw with bound CB slots; scans at most DXMT_MV_PROBE_CB_DRAWS armed draws.
  */
 struct MvProbeCbSlot {
   ID3D11Resource *buffer = nullptr;
   UINT first_constant = 0;
   UINT num_constants = 0;
 };
-void noteSceneDrawForMvProbe(ID3D11Device *device, const MvProbeCbSlot slots[14]);
+void noteSceneDrawForMvProbe(
+    ID3D11Device *device, const MvProbeCbSlot vs_slots[14],
+    const MvProbeCbSlot *ps_slots, float viewport_min_depth, float viewport_max_depth
+);
 /** Advance Present tick: arm Arm B for the next sampled Present. */
 void noteMvProbePresent(uint64_t presentation_count);
+/** Arm D: rate-limited staging readback (`DXMT_MV_PROBE_RB=1`). */
+bool mvReadbackEnabled();
+void noteMvReadbackTick(
+    ID3D11Device *device, ID3D11DeviceContext *ctx, uint64_t presentation_count,
+    UINT swapchain_w, UINT swapchain_h
+);
+/** Release readback staging / held refs (device teardown or swapchain resize). */
+void releaseMvProbeReadback(ID3D11Device *device);
+/** Arm E: depth convention probes (metadata only). */
+void noteSceneDepthClear(
+    ID3D11DepthStencilView *dsv, UINT clear_flags, float depth
+);
+void noteDepthStencilState(
+    ID3D11DepthStencilState *state, ID3D11DepthStencilView *current_dsv,
+    ID3D11Device *device
+);
+/** Clear prepared probe log buffer after swapchain emission. */
+void mvProbeClearPreparedLogs();
 /**
  * Build period-aggregated `mv_probe=` lines and reset census counters.
  * Caller emits via swapchain LogMvProbeStrategy (or mvProbeEmitPreparedLogs).
