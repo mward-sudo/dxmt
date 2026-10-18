@@ -12,6 +12,9 @@ namespace present_dm {
 namespace {
 
 std::atomic<uint64_t> g_temporal_upscale_count{0};
+std::atomic<uint64_t> g_unified_temporal_encode_count{0};
+std::atomic<UINT> g_last_unified_present_w{0};
+std::atomic<UINT> g_last_unified_present_h{0};
 
 /** Per-device Present-dm state (tip 15). Key is raw ID3D11Device*; cleared in
  *  clearDevice on teardown — do not AddRef the map key. */
@@ -171,6 +174,28 @@ temporalUpscaleCount() {
 }
 
 void
+noteUnifiedTemporalPresent(UINT output_w, UINT output_h) {
+  g_unified_temporal_encode_count.fetch_add(1, std::memory_order_relaxed);
+  g_last_unified_present_w.store(output_w, std::memory_order_relaxed);
+  g_last_unified_present_h.store(output_h, std::memory_order_relaxed);
+}
+
+uint64_t
+unifiedTemporalEncodeCount() {
+  return g_unified_temporal_encode_count.load(std::memory_order_relaxed);
+}
+
+UINT
+lastUnifiedPresentWidth() {
+  return g_last_unified_present_w.load(std::memory_order_relaxed);
+}
+
+UINT
+lastUnifiedPresentHeight() {
+  return g_last_unified_present_h.load(std::memory_order_relaxed);
+}
+
+void
 trackSceneDepth(ID3D11DepthStencilView *dsv) {
   if (!dsv || !enabled() || !trackedDepthAllowed())
     return;
@@ -303,6 +328,9 @@ logPresentTick(
   if (!verbose() && presentation_count > 3 && (presentation_count % 300) != 0)
     return;
   auto temporal = temporalUpscaleCount();
+  auto unified = unifiedTemporalEncodeCount();
+  const UINT up_w = lastUnifiedPresentWidth();
+  const UINT up_h = lastUnifiedPresentHeight();
   const bool depth_est = isLabeledEstimate(depth_provenance);
   const bool motion_est = isLabeledEstimate(motion_provenance);
   const char *truth =
@@ -317,6 +345,8 @@ logPresentTick(
       " provenance_truth=", truth,
       " temporal_upscale_count=", temporal,
       " title_temporal_silent=", (temporal == 0) ? "yes" : "no",
+      " unified_temporal_encode_count=", unified,
+      " last_unified_present=", up_w, "x", up_h,
       " ", encode,
       " (also check nvngx.log for EvaluateFeature; expected silence on ETS2 Picture)"
   );

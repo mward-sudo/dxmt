@@ -1159,6 +1159,16 @@ public:
             }
             ctx.present(upscaled, presenter, vsync_duration, state.metadata);
           }
+          // Tip 16: proof that Present showed the upscaled backbuffer (not pre-upscale).
+          present_dm::noteUnifiedTemporalPresent(upscaled->width(), upscaled->height());
+          const uint64_t n = present_dm::unifiedTemporalEncodeCount();
+          if (n == 1 || (n % 300u) == 0u) {
+            WARN(
+                "unified-metalfx: present_target=upscaled out=", upscaled->width(), "x",
+                upscaled->height(), " unified_temporal_encode_count=", n,
+                " (input=", content_w, "x", content_h, ")"
+            );
+          }
           ReleaseSemaphore(present_semaphore_, 1, nullptr);
           this->UpdateStatistics(ctx.queue().statistics, ctx.currentFrameId());
         });
@@ -1169,6 +1179,9 @@ public:
           WARN(
               "unified-metalfx: pacing rendered=", rendered_present_count_,
               " presented=", presented_present_count_,
+              " unified_encode=", present_dm::unifiedTemporalEncodeCount(),
+              " last_out=", present_dm::lastUnifiedPresentWidth(), "x",
+              present_dm::lastUnifiedPresentHeight(),
               " interp=",
               (have_interp ? "on"
                            : (fi_gate ? "off_waiting_stable" : "off_disabled_until_upscale_boot_stable")),

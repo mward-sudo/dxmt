@@ -51,8 +51,17 @@ void noteTemporalUpscale(
     ID3D11Resource *color, ID3D11Resource *depth, ID3D11Resource *motion_vector
 );
 
-/** TemporalUpscale / title path count visible inside d3d11.dll (Present proof). */
+/** TemporalUpscale / title path count visible inside d3d11.dll (NGX/title proof). */
 uint64_t temporalUpscaleCount();
+
+/**
+ * Tip 16: count unified Present-path temporal encodes that presented the
+ * upscaled backbuffer (not NGX title EvaluateFeature; not pre-upscale fallback).
+ */
+void noteUnifiedTemporalPresent(UINT output_w, UINT output_h);
+uint64_t unifiedTemporalEncodeCount();
+UINT lastUnifiedPresentWidth();
+UINT lastUnifiedPresentHeight();
 
 /** Track last immediate-context scene DSV for this device (may be unbound at Present). */
 void trackSceneDepth(ID3D11DepthStencilView *dsv);
