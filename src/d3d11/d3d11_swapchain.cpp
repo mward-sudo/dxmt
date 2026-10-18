@@ -1151,6 +1151,13 @@ public:
       present_dm::logStep("present1:prev_color_update_end");
     }
 
+    // Crash I evidence: ExportPresentDepthMotion (ClearRTV estimates / CopyResource)
+    // and UpdatePresentPrevColor leave cmdbuf_state != Idle (render/blit encoder
+    // active). Commit() requires Idle (d3d11_context_imm.cpp:599). In NDEBUG
+    // builds the assert is a no-op → CommitCurrentChunk with an open encoder →
+    // Wine page fault in winemetal.so (crashes D–H). End any pass first.
+    present_dm::logStep("present1:prepare_flush_before_commit");
+    device_context_->PrepareFlush();
     present_dm::logStep("present1:commit_begin");
     device_context_->Commit();
     present_dm::logStep("present1:commit_end");
@@ -2293,22 +2300,26 @@ CreateSwapChain(
   }
   // Unified temporal Present (scaler on one path; FI encode opt-in).
   // Prefer over spatial so the same tick never runs spatial+sidecar / hybrid.
-  // Bisection size gate: DXMT_METALFX_UNIFIED_MIN_W / _MIN_H (e.g. 1920 / 1080)
-  // falls tiny/helper swapchains back to Off so only primary-sized chains arm.
+  // Size guard (crash I / ranked defect #1): default min 256×256 so Steam
+  // overlay / helper chains (109×1, 119×37) stay Off. Override with
+  // DXMT_METALFX_UNIFIED_MIN_W / _MIN_H (set "0" to disable that axis).
   if (env::getEnvVar("DXMT_METALFX_UNIFIED_TEMPORAL_INTERP") == "1") {
-    const uint32_t min_w = (uint32_t)std::strtoul(
-        env::getEnvVar("DXMT_METALFX_UNIFIED_MIN_W").c_str(), nullptr, 10
-    );
-    const uint32_t min_h = (uint32_t)std::strtoul(
-        env::getEnvVar("DXMT_METALFX_UNIFIED_MIN_H").c_str(), nullptr, 10
-    );
+    constexpr uint32_t kDefaultUnifiedMinW = 256;
+    constexpr uint32_t kDefaultUnifiedMinH = 256;
+    const std::string env_min_w = env::getEnvVar("DXMT_METALFX_UNIFIED_MIN_W");
+    const std::string env_min_h = env::getEnvVar("DXMT_METALFX_UNIFIED_MIN_H");
+    const uint32_t min_w =
+        env_min_w.empty() ? kDefaultUnifiedMinW
+                          : (uint32_t)std::strtoul(env_min_w.c_str(), nullptr, 10);
+    const uint32_t min_h =
+        env_min_h.empty() ? kDefaultUnifiedMinH
+                          : (uint32_t)std::strtoul(env_min_h.c_str(), nullptr, 10);
     const bool size_ok =
         (min_w == 0 || pDesc->Width >= min_w) && (min_h == 0 || pDesc->Height >= min_h);
     if (!size_ok) {
       WARN(
           "unified-metalfx: CreateSwapChain ", pDesc->Width, "x", pDesc->Height,
-          " below DXMT_METALFX_UNIFIED_MIN_", min_w, "x", min_h,
-          " — Off (bisection size gate)"
+          " below unified min ", min_w, "x", min_h, " — Off (size guard)"
       );
     } else if (pDevice->GetMTLDevice().supportsFXTemporalScaler()) {
       if (env::getEnvVar("DXMT_METALFX_UNIFIED_FI") == "1" &&
