@@ -981,16 +981,24 @@ public:
           FlushPresentDmLog(dm_label.c_str());
         }
       }
-      // Tip 18: FI opt-in via DXMT_METALFX_UNIFIED_FI=1; requires guard Stable + streak.
+      // Tip 18/19: FI opt-in via DXMT_METALFX_UNIFIED_FI=1; requires guard Stable +
+      // streak. Tip 19: never FI on labeled estimate depth/motion (zero-MV FI
+      // glitches static UI; honesty — estimates are not engine truth).
       // Any failure degrades to temporal-upscale-only (no spatial+sidecar).
       const bool fi_gate = UnifiedFiEncodeEnabled();
       const char *fi_skip = nullptr;
       bool have_interp = false;
+      const bool estimate_inputs =
+          present_dm::isLabeledEstimate(present_dm_depth_prov_) ||
+          present_dm::isLabeledEstimate(present_dm_motion_prov_);
       if (!fi_gate) {
         metalfx_frame_interpolator_ = nullptr;
         fi_skip = "skip_reason=disabled_until_DXMT_METALFX_UNIFIED_FI";
       } else if (!encoded) {
         fi_skip = "skip_reason=temporal_bind_unsafe";
+      } else if (estimate_inputs) {
+        metalfx_frame_interpolator_ = nullptr;
+        fi_skip = "skip_reason=estimate_inputs";
       } else if (guard_phase_ != TemporalGuardPhase::Stable) {
         fi_skip = "skip_reason=awaiting_guard_stable";
       } else if (!prev_valid) {
