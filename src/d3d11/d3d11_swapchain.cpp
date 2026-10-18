@@ -981,17 +981,18 @@ public:
           FlushPresentDmLog(dm_label.c_str());
         }
       }
-      // Crash E tip: default never create/encode FrameInterpolator. Opt-in later via
-      // DXMT_METALFX_UNIFIED_FI=1 (still subject to streak / identity preempt).
+      // Tip 18: FI opt-in via DXMT_METALFX_UNIFIED_FI=1; requires guard Stable + streak.
+      // Any failure degrades to temporal-upscale-only (no spatial+sidecar).
       const bool fi_gate = UnifiedFiEncodeEnabled();
       const char *fi_skip = nullptr;
       bool have_interp = false;
       if (!fi_gate) {
-        // Prefer skip FI create entirely — remove MetalFX FI from the crash surface.
         metalfx_frame_interpolator_ = nullptr;
-        fi_skip = "skip_reason=disabled_until_upscale_boot_stable";
+        fi_skip = "skip_reason=disabled_until_DXMT_METALFX_UNIFIED_FI";
       } else if (!encoded) {
         fi_skip = "skip_reason=temporal_bind_unsafe";
+      } else if (guard_phase_ != TemporalGuardPhase::Stable) {
+        fi_skip = "skip_reason=awaiting_guard_stable";
       } else if (!prev_valid) {
         fi_skip = "skip_reason=prev_color_missing";
       } else if (metalfx_stable_present_streak_ < kMetalFXFiStablePresentsRequired) {
@@ -1137,6 +1138,15 @@ public:
             // Pace: interpolated midpoint, then rendered — same Presenter owner.
             ctx.present(interpolated, presenter, half_vsync, state.metadata);
             ctx.present(upscaled, presenter, vsync_duration, state.metadata);
+            present_dm::noteUnifiedFiPresent(interpolated->width(), interpolated->height());
+            const uint64_t fi_n = present_dm::unifiedFiPresentCount();
+            if (fi_n == 1 || (fi_n % 300u) == 0u) {
+              WARN(
+                  "unified-metalfx: present_target=upscaled+interp out=", upscaled->width(),
+                  "x", upscaled->height(), " unified_fi_present_count=", fi_n,
+                  " (input=", content_w, "x", content_h, ")"
+              );
+            }
           } else {
             if (have_interp) {
               WARN(
@@ -1149,7 +1159,7 @@ public:
           // Tip 16: proof that Present showed the upscaled backbuffer (not pre-upscale).
           present_dm::noteUnifiedTemporalPresent(upscaled->width(), upscaled->height());
           const uint64_t n = present_dm::unifiedTemporalEncodeCount();
-          if (n == 1 || (n % 300u) == 0u) {
+          if ((!have_interp || !interpolated) && (n == 1 || (n % 300u) == 0u)) {
             WARN(
                 "unified-metalfx: present_target=upscaled out=", upscaled->width(), "x",
                 upscaled->height(), " unified_temporal_encode_count=", n,
@@ -1704,8 +1714,8 @@ private:
 
   /**
    * Opt-in FrameInterpolate encode on the unified temporal path.
-   * Default OFF (crash E tip): upscale-only boot until D32S8 / temporal encode
-   * is proven stable. Later tip may raise N and re-enable behind this gate.
+   * Default OFF. Tip 18: enable with DXMT_METALFX_UNIFIED_FI=1 after upscale
+   * Stable (guard phase + streak); degrade to upscale-only on any FI failure.
    */
   static bool UnifiedFiEncodeEnabled() {
     return env::getEnvVar("DXMT_METALFX_UNIFIED_FI") == "1";

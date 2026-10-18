@@ -63,6 +63,10 @@ uint64_t unifiedTemporalEncodeCount();
 UINT lastUnifiedPresentWidth();
 UINT lastUnifiedPresentHeight();
 
+/** Tip 18: count unified Present ticks that paced interpolated + upscaled. */
+void noteUnifiedFiPresent(UINT output_w, UINT output_h);
+uint64_t unifiedFiPresentCount();
+
 /** Track last immediate-context scene DSV for this device (may be unbound at Present). */
 void trackSceneDepth(ID3D11DepthStencilView *dsv);
 
