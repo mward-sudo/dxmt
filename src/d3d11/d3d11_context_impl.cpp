@@ -2896,6 +2896,11 @@ public:
               ppRenderTargetViews, NumRTVs, pDepthStencilView
           );
         }
+        if (present_dm::realMotionEnabled()) [[unlikely]] {
+          present_dm::noteMotionBindCandidate(
+              ppRenderTargetViews, NumRTVs, pDepthStencilView
+          );
+        }
       }
     }
 

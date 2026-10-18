@@ -153,6 +153,31 @@ bool resolveTitleMotion(
     ID3D11Device *device, ID3D11Resource **out_motion, const char **out_provenance
 );
 
+/**
+ * Tip 28: bind engine half4/RG velocity RT into Present motion.
+ * Default-on when unified temporal is armed; kill with DXMT_METALFX_REAL_MOTION=0.
+ * Does not require DXMT_MV_PROBE*.
+ */
+bool realMotionEnabled();
+/** Announce Present color size so OMSet candidates can be filtered to exact match. */
+void setMotionBindTargetSize(UINT width, UINT height);
+/** Record exact-size motion-format RTVs from immediate OMSet (AddRef held). */
+void noteMotionBindCandidate(
+    ID3D11RenderTargetView *const *rtvs, UINT num_rtvs, ID3D11DepthStencilView *dsv
+);
+/**
+ * Pick best held candidate for color_w×color_h. On success out_motion is AddRef'd
+ * and provenance is kMotionEngineRt.
+ */
+bool resolveEngineMotion(
+    ID3D11Device *device, UINT color_w, UINT color_h, ID3D11Resource **out_motion,
+    const char **out_provenance, uint32_t *out_rid
+);
+/** Drop held motion-bind refs (device teardown / swapchain resize). */
+void releaseMotionBindCandidates(ID3D11Device *device);
+/** ETS2 tip27b Arm E: reverse-Z when real depth is in use. */
+bool preferDepthReversed();
+
 /** True when provenance is an ESTIMATE_* label (not engine / title truth). */
 bool isLabeledEstimate(const char *provenance);
 
@@ -164,6 +189,7 @@ constexpr const char *kDepthTitleTemporal = "REAL_DEPTH_TITLE_TEMPORAL";
 constexpr const char *kDepthResolvedD32S8 = "REAL_DEPTH_RESOLVED_D32S8";
 constexpr const char *kDepthMissing = "REAL_DEPTH_MISSING";
 constexpr const char *kMotionTitle = "REAL_MOTION_TITLE_TEMPORAL";
+constexpr const char *kMotionEngineRt = "REAL_MOTION_ENGINE_RT";
 
 /* Labeled estimates — only after real path failed; never treat as engine truth */
 constexpr const char *kMotionEstimateZero = "ESTIMATE_MOTION_ZERO";

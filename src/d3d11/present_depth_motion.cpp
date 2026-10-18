@@ -1409,6 +1409,7 @@ void
 clearDevice(ID3D11Device *device) {
   if (!device)
     return;
+  releaseMotionBindCandidates(device);
   std::lock_guard<std::mutex> lock(g_lock);
   if (auto it = g_by_device.find(device); it != g_by_device.end()) {
     releaseMvProbeReadbackLocked(&it->second);
@@ -1916,6 +1917,238 @@ resolveTitleMotion(
     return false;
   *out_motion = it->second.title_motion.ref();
   *out_provenance = kMotionTitle;
+  return true;
+}
+
+namespace {
+
+constexpr size_t kMotionBindCap = 4;
+
+struct MotionBindCand {
+  dxmt::Com<ID3D11Resource> resource;
+  uint32_t rid = 0;
+  DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+  UINT width = 0;
+  UINT height = 0;
+  uint32_t slot_mask = 0;
+  uint64_t binds = 0;
+  uint64_t binds_with_dsv = 0;
+  bool valid = false;
+};
+
+struct MotionBindDevice {
+  MotionBindCand slots[kMotionBindCap]{};
+  uint32_t count = 0;
+};
+
+std::unordered_map<ID3D11Device *, MotionBindDevice> g_motion_bind;
+std::atomic<UINT> g_motion_bind_target_w{0};
+std::atomic<UINT> g_motion_bind_target_h{0};
+
+bool
+motionFormatEligible(DXGI_FORMAT fmt) {
+  switch (fmt) {
+  case DXGI_FORMAT_R16G16B16A16_FLOAT:
+  case DXGI_FORMAT_R16G16_FLOAT:
+  case DXGI_FORMAT_R32G32_FLOAT:
+  case DXGI_FORMAT_R16G16_SNORM:
+    return true;
+  default:
+    return false;
+  }
+}
+
+int
+motionFormatRank(DXGI_FORMAT fmt) {
+  /* Prefer half4 lead (tip27b); then classic RG velocity formats. */
+  switch (fmt) {
+  case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    return 0;
+  case DXGI_FORMAT_R16G16_FLOAT:
+  case DXGI_FORMAT_R32G32_FLOAT:
+  case DXGI_FORMAT_R16G16_SNORM:
+    return 1;
+  default:
+    return 9;
+  }
+}
+
+uint32_t
+motionBindRid(ID3D11Resource *resource) {
+  const uintptr_t p = reinterpret_cast<uintptr_t>(resource);
+  return (uint32_t)(p ^ (p >> 32));
+}
+
+bool
+motionBindTex2DDesc(ID3D11Resource *resource, D3D11_TEXTURE2D_DESC *desc) {
+  if (!resource || !desc)
+    return false;
+  dxmt::Com<ID3D11Texture2D> tex;
+  if (FAILED(resource->QueryInterface(IID_PPV_ARGS(&tex))))
+    return false;
+  tex->GetDesc(desc);
+  return true;
+}
+
+} // namespace
+
+bool
+realMotionEnabled() {
+  if (envIsZero("DXMT_METALFX_REAL_MOTION"))
+    return false;
+  if (envIsOne("DXMT_METALFX_REAL_MOTION"))
+    return true;
+  /* Default-on when unified temporal Present path is armed. */
+  return envIsOne("DXMT_METALFX_UNIFIED_TEMPORAL_INTERP");
+}
+
+void
+setMotionBindTargetSize(UINT width, UINT height) {
+  g_motion_bind_target_w.store(width, std::memory_order_relaxed);
+  g_motion_bind_target_h.store(height, std::memory_order_relaxed);
+}
+
+void
+noteMotionBindCandidate(
+    ID3D11RenderTargetView *const *rtvs, UINT num_rtvs, ID3D11DepthStencilView *dsv
+) {
+  if (!realMotionEnabled() || !rtvs || num_rtvs == 0)
+    return;
+  const UINT tw = g_motion_bind_target_w.load(std::memory_order_relaxed);
+  const UINT th = g_motion_bind_target_h.load(std::memory_order_relaxed);
+  if (tw == 0 || th == 0)
+    return;
+
+  ID3D11Device *device = nullptr;
+  if (rtvs[0])
+    rtvs[0]->GetDevice(&device);
+  else if (dsv)
+    dsv->GetDevice(&device);
+  if (!device)
+    return;
+  dxmt::Com<ID3D11Device> device_hold;
+  device_hold = device;
+  device->Release();
+
+  const bool with_dsv = dsv != nullptr;
+  std::lock_guard<std::mutex> lock(g_lock);
+  MotionBindDevice &st = g_motion_bind[device_hold.ptr()];
+  for (UINT i = 0; i < num_rtvs && i < 8; i++) {
+    if (!rtvs[i])
+      continue;
+    dxmt::Com<ID3D11Resource> resource;
+    rtvs[i]->GetResource(&resource);
+    if (!resource)
+      continue;
+    D3D11_TEXTURE2D_DESC desc{};
+    if (!motionBindTex2DDesc(resource.ptr(), &desc))
+      continue;
+    if (desc.Width != tw || desc.Height != th)
+      continue;
+    if (!motionFormatEligible(desc.Format))
+      continue;
+
+    MotionBindCand *slot = nullptr;
+    for (uint32_t s = 0; s < st.count; s++) {
+      if (st.slots[s].valid && st.slots[s].resource.ptr() == resource.ptr()) {
+        slot = &st.slots[s];
+        break;
+      }
+    }
+    if (!slot) {
+      if (st.count >= kMotionBindCap) {
+        /* Evict lowest-score. */
+        uint32_t worst = 0;
+        for (uint32_t s = 1; s < st.count; s++) {
+          if (st.slots[s].binds < st.slots[worst].binds)
+            worst = s;
+        }
+        st.slots[worst] = {};
+        slot = &st.slots[worst];
+      } else {
+        slot = &st.slots[st.count++];
+      }
+      slot->resource = resource;
+      slot->rid = motionBindRid(resource.ptr());
+      slot->format = desc.Format;
+      slot->width = desc.Width;
+      slot->height = desc.Height;
+      slot->valid = true;
+    }
+    slot->binds++;
+    if (with_dsv)
+      slot->binds_with_dsv++;
+    slot->slot_mask |= (1u << i);
+  }
+}
+
+bool
+resolveEngineMotion(
+    ID3D11Device *device, UINT color_w, UINT color_h, ID3D11Resource **out_motion,
+    const char **out_provenance, uint32_t *out_rid
+) {
+  if (!out_motion || !out_provenance)
+    return false;
+  *out_motion = nullptr;
+  *out_provenance = kMotionUnavailable;
+  if (out_rid)
+    *out_rid = 0;
+  if (!realMotionEnabled() || !device || color_w == 0 || color_h == 0)
+    return false;
+
+  std::lock_guard<std::mutex> lock(g_lock);
+  auto it = g_motion_bind.find(device);
+  if (it == g_motion_bind.end())
+    return false;
+  MotionBindDevice &st = it->second;
+  MotionBindCand *best = nullptr;
+  for (uint32_t s = 0; s < st.count; s++) {
+    MotionBindCand &c = st.slots[s];
+    if (!c.valid || !c.resource)
+      continue;
+    if (c.width != color_w || c.height != color_h)
+      continue;
+    if (!best) {
+      best = &c;
+      continue;
+    }
+    const int ra = motionFormatRank(c.format);
+    const int rb = motionFormatRank(best->format);
+    if (ra != rb) {
+      if (ra < rb)
+        best = &c;
+      continue;
+    }
+    if (c.binds_with_dsv != best->binds_with_dsv) {
+      if (c.binds_with_dsv > best->binds_with_dsv)
+        best = &c;
+      continue;
+    }
+    if (c.binds > best->binds)
+      best = &c;
+  }
+  if (!best)
+    return false;
+  *out_motion = best->resource.ref();
+  *out_provenance = kMotionEngineRt;
+  if (out_rid)
+    *out_rid = best->rid;
+  return true;
+}
+
+void
+releaseMotionBindCandidates(ID3D11Device *device) {
+  std::lock_guard<std::mutex> lock(g_lock);
+  if (!device) {
+    g_motion_bind.clear();
+    return;
+  }
+  g_motion_bind.erase(device);
+}
+
+bool
+preferDepthReversed() {
+  /* tip27b Arm E on ETS2: reverse_z (GREATER_EQUAL, clear=0). */
   return true;
 }
 

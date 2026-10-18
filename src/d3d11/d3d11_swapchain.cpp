@@ -564,6 +564,8 @@ public:
     backbuffer_->Release();
 
     present_dm::releaseMvProbeReadback(device_);
+    present_dm::releaseMotionBindCandidates(device_);
+    present_dm::setMotionBindTargetSize(backbuffer_desc_.Width, backbuffer_desc_.Height);
     // present-dm: reset history on resize
     present_prev_color_ = nullptr;
     present_depth_ = nullptr;
@@ -571,6 +573,10 @@ public:
     depth_resolve_target_ = nullptr;
     depth_resolve_src_ = nullptr;
     present_prev_color_valid_ = false;
+    motion_bind_failed_ = false;
+    motion_bind_promoted_ = false;
+    motion_bind_sticky_logged_ = false;
+    motion_bind_rid_ = 0;
     if (present_dm::enabled())
       EnsurePresentPrevColorTexture();
 
@@ -1126,11 +1132,21 @@ public:
           props.input_content_width = content_w;
           props.input_content_height = content_h;
           props.reset = reset;
-          // Labeled depth estimate is conventional far=1; real tracked depth may be
-          // reversed-Z — not forged here.
-          props.depth_reversed = false;
+          // tip27b Arm E: ETS2 reverse-Z when real depth/motion bound.
+          const bool reverse_z =
+              present_dm::preferDepthReversed() &&
+              !present_dm::isLabeledEstimate(present_dm_depth_prov_);
+          props.depth_reversed = reverse_z;
           props.motion_vector_scale_x = float(content_w);
           props.motion_vector_scale_y = float(content_h);
+          if (!motion_scale_warn_logged_ &&
+              !present_dm::isLabeledEstimate(present_dm_motion_prov_)) {
+            motion_scale_warn_logged_ = true;
+            WARN(
+                "unified-metalfx: motion_scale=content_px ", content_w, "x", content_h,
+                " (tip27b unit_hint was ndc? — tip29 may set 1.0)"
+            );
+          }
           props.jitter_offset_x = 0.f;
           props.jitter_offset_y = 0.f;
           props.pre_exposure = 1.f;
@@ -1154,7 +1170,7 @@ public:
           if (can_interp) {
             WMTFXFrameInterpolatorProps iprops{};
             iprops.should_reset_history = reset;
-            iprops.depth_reversed = false;
+            iprops.depth_reversed = reverse_z;
             iprops.motion_vector_scale_x = float(content_w);
             iprops.motion_vector_scale_y = float(content_h);
             iprops.jitter_offset_x = 0.f;
@@ -2418,6 +2434,7 @@ private:
     Com<ID3D11Resource> motion_src;
     bool need_estimate_motion = true;
     present_dm::logStep("export:resolve_motion_begin");
+    present_dm::setMotionBindTargetSize(backbuffer_desc_.Width, backbuffer_desc_.Height);
     if (present_dm::resolveTitleMotion(device_, &motion_src, &motion_prov)) {
       if (EnsurePresentCopyTexture(present_motion_, motion_src.ptr(), 0)) {
         present_dm::logStep("export:motion_copy_begin");
@@ -2426,12 +2443,60 @@ private:
         );
         present_dm::logStep("export:motion_copy_end");
         need_estimate_motion = false;
+        motion_bind_failed_ = false;
       } else {
         motion_prov = present_dm::kMotionUnavailable;
         need_estimate_motion = true;
         // Keep live motion estimate — do not null.
       }
+    } else if (
+        present_dm::realMotionEnabled() && !motion_bind_failed_ &&
+        present_dm::resolveEngineMotion(
+            device_, backbuffer_desc_.Width, backbuffer_desc_.Height, &motion_src,
+            &motion_prov, &motion_bind_rid_
+        )
+    ) {
+      if (EnsurePresentCopyTexture(present_motion_, motion_src.ptr(), 0)) {
+        present_dm::logStep("export:engine_motion_copy_begin");
+        device_context_->CopyResource(
+            static_cast<ID3D11Resource *>(present_motion_.ptr()), motion_src.ptr()
+        );
+        present_dm::logStep("export:engine_motion_copy_end");
+        need_estimate_motion = false;
+        motion_bind_failed_ = false;
+        if (!motion_bind_promoted_) {
+          motion_bind_promoted_ = true;
+          OnMetalFXDepthOrMotionIdentityChanged("motion_engine_rt_promote");
+          WARN(
+              "unified-metalfx: motion_bind=REAL_MOTION_ENGINE_RT rid=",
+              motion_bind_rid_, " ", backbuffer_desc_.Width, "x",
+              backbuffer_desc_.Height
+          );
+        }
+      } else {
+        motion_prov = present_dm::kMotionUnavailable;
+        need_estimate_motion = true;
+        motion_bind_failed_ = true;
+        WARN("unified-metalfx: motion_bind=skip_reason=copy_ensure_failed");
+      }
     } else {
+      if (present_dm::realMotionEnabled() && motion_bind_failed_) {
+        if (!motion_bind_sticky_logged_) {
+          motion_bind_sticky_logged_ = true;
+          WARN("unified-metalfx: motion_bind=skip_reason=failed_sticky");
+        }
+      } else if (present_dm::realMotionEnabled() && !motion_bind_failed_) {
+        /* Exact-size candidate missing (often 1352 scene vs 1080 color). */
+        static bool size_gap_logged = false;
+        if (!size_gap_logged) {
+          size_gap_logged = true;
+          WARN(
+              "unified-metalfx: motion_bind=skip_reason=no_exact_size_candidate ",
+              backbuffer_desc_.Width, "x", backbuffer_desc_.Height,
+              " (tip28 requires color-sized RT; 1352≠1080 demotes)"
+          );
+        }
+      }
       motion_prov = present_dm::kMotionUnavailable;
       need_estimate_motion = true;
       // Keep owned zero-MV estimate across REAL_MOTION_UNAVAILABLE presents.
@@ -2531,6 +2596,11 @@ private:
   Rc<Texture> depth_resolve_src_;
   bool depth_resolve_pending_ = false;
   bool depth_resolve_failed_ = false;
+  bool motion_bind_failed_ = false;
+  bool motion_bind_promoted_ = false;
+  bool motion_bind_sticky_logged_ = false;
+  bool motion_scale_warn_logged_ = false;
+  uint32_t motion_bind_rid_ = 0;
   bool depth_resolve_promoted_ = false;
   bool present_prev_color_valid_ = false;
   HANDLE present_semaphore_;
