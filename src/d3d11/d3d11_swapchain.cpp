@@ -38,6 +38,34 @@ constexpr size_t kSwapchainLatency = 1;
 
 namespace dxmt {
 
+/** Unified temporal size gate (Create + Resize + Present). Env override
+ *  DXMT_METALFX_UNIFIED_MIN_W / _MIN_H; "0" disables that axis. */
+constexpr uint32_t kDefaultUnifiedMinW = 256;
+constexpr uint32_t kDefaultUnifiedMinH = 256;
+
+struct UnifiedSizeLimits {
+  uint32_t min_w = kDefaultUnifiedMinW;
+  uint32_t min_h = kDefaultUnifiedMinH;
+};
+
+UnifiedSizeLimits
+unifiedSizeLimits() {
+  UnifiedSizeLimits lim;
+  const std::string env_min_w = env::getEnvVar("DXMT_METALFX_UNIFIED_MIN_W");
+  const std::string env_min_h = env::getEnvVar("DXMT_METALFX_UNIFIED_MIN_H");
+  if (!env_min_w.empty())
+    lim.min_w = (uint32_t)std::strtoul(env_min_w.c_str(), nullptr, 10);
+  if (!env_min_h.empty())
+    lim.min_h = (uint32_t)std::strtoul(env_min_h.c_str(), nullptr, 10);
+  return lim;
+}
+
+bool
+unifiedSizeOk(uint32_t width, uint32_t height) {
+  const UnifiedSizeLimits lim = unifiedSizeLimits();
+  return (lim.min_w == 0 || width >= lim.min_w) && (lim.min_h == 0 || height >= lim.min_h);
+}
+
 WMTPixelFormat ConvertSwapChainFormat(DXGI_FORMAT format) {
   switch (format) {
   case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
@@ -568,6 +596,8 @@ public:
     if constexpr (kTemporal) {
       // Temporal scaler created lazily once Present-export depth/motion formats
       // are known. FI create/encode stays off unless DXMT_METALFX_UNIFIED_FI=1.
+      // Tip 13: Create-time size gate is not enough — Steam helpers often create
+      // large then ResizeBuffers to 109×1 / 119×37; demote encode here.
       metalfx_temporal_scaler_ = nullptr;
       metalfx_frame_interpolator_ = nullptr;
       interpolated_backbuffer_ = nullptr;
@@ -587,21 +617,32 @@ public:
       metalfx_stable_fi_ = nullptr;
       temporal_bound_depth_tex_ = nullptr;
       temporal_bound_motion_tex_ = nullptr;
-      D3D11_TEXTURE2D_DESC1 interp_desc = backbuffer_desc_;
-      interp_desc.Height *= scale_factor;
-      interp_desc.Width *= scale_factor;
-      if (FAILED(dxmt::CreateDeviceTexture2D(
-              device_, &interp_desc, nullptr, reinterpret_cast<ID3D11Texture2D1 **>(&interpolated_backbuffer_)
-          ))) {
-        ERR("unified-metalfx: interpolated backbuffer create failed");
-        return E_FAIL;
+      if (!unifiedSizeOk(desc_.Width, desc_.Height)) {
+        temporal_inactive_below_size_ = true;
+        const UnifiedSizeLimits lim = unifiedSizeLimits();
+        WARN(
+            "unified-metalfx: ResizeBuffers ", desc_.Width, "x", desc_.Height,
+            " below unified min ", lim.min_w, "x", lim.min_h,
+            " — temporal encode demoted (pre-upscale Present only)"
+        );
+      } else {
+        temporal_inactive_below_size_ = false;
+        D3D11_TEXTURE2D_DESC1 interp_desc = backbuffer_desc_;
+        interp_desc.Height *= scale_factor;
+        interp_desc.Width *= scale_factor;
+        if (FAILED(dxmt::CreateDeviceTexture2D(
+                device_, &interp_desc, nullptr, reinterpret_cast<ID3D11Texture2D1 **>(&interpolated_backbuffer_)
+            ))) {
+          ERR("unified-metalfx: interpolated backbuffer create failed");
+          return E_FAIL;
+        }
+        WARN(
+            "unified-metalfx: temporal upscale-only Present path armed (FI encode disabled until "
+            "DXMT_METALFX_UNIFIED_FI=1) input=",
+            desc_.Width, "x", desc_.Height, " output=", (uint32_t)(desc_.Width * scale_factor), "x",
+            (uint32_t)(desc_.Height * scale_factor)
+        );
       }
-      WARN(
-          "unified-metalfx: temporal upscale-only Present path armed (FI encode disabled until "
-          "DXMT_METALFX_UNIFIED_FI=1) input=",
-          desc_.Width, "x", desc_.Height, " output=", (uint32_t)(desc_.Width * scale_factor), "x",
-          (uint32_t)(desc_.Height * scale_factor)
-      );
     }
 
     return S_OK;
@@ -890,6 +931,11 @@ public:
         this->UpdateStatistics(ctx.queue().statistics, ctx.currentFrameId());
       });
     } else if constexpr (kTemporal) {
+      // Tip 13: re-check size every Present (covers ResizeBuffers demotion).
+      if (temporal_inactive_below_size_ || !unifiedSizeOk(desc_.Width, desc_.Height)) {
+        temporal_inactive_below_size_ = true;
+        MarkTemporalEncodeSkip("skip_reason=size_gate");
+      }
       Rc<Texture> depth_tex = present_depth_ ? present_depth_->texture() : nullptr;
       Rc<Texture> motion_tex = present_motion_ ? present_motion_->texture() : nullptr;
       const bool prev_valid = present_prev_color_valid_ && present_prev_color_;
@@ -899,8 +945,9 @@ public:
       // Depth must be bindable R32Float/Depth32Float — never encode with Invalid/D32S8.
       // Upscale-only boot: interpolated_backbuffer_ is reserved for opt-in FI; temporal
       // encode only needs scaler + upscaled backbuffer.
-      const bool bindings_ok = depth_tex && motion_tex && depth_bind_fmt != WMTPixelFormatInvalid &&
-                               upscaled_backbuffer_;
+      const bool size_ok_for_encode = !temporal_inactive_below_size_;
+      const bool bindings_ok = size_ok_for_encode && depth_tex && motion_tex &&
+                               depth_bind_fmt != WMTPixelFormatInvalid && upscaled_backbuffer_;
       // Crash G: after scaler destroy (D32S8 / identity), do not recreate for N Presents.
       // Tip-10 skipped encode on the destroy Present but EnsureTemporalScaler still
       // created on the next Present → page fault while claiming encode skipped.
@@ -2249,6 +2296,8 @@ private:
   bool estimate_motion_reallocated_this_export_ = false;
   /** Latched after first D32S8 unsuitable skip so transition reset fires once. */
   bool d32s8_unsuitable_depth_seen_ = false;
+  /** Tip 13: ResizeBuffers (or Present) dropped below unified min — no encode. */
+  bool temporal_inactive_below_size_ = false;
   /** Remaining Presents that must not call EnsureTemporalScaler after destroy. */
   uint32_t metalfx_scaler_recreate_cooldown_ = 0;
   std::string metalfx_scaler_recreate_cooldown_reason_;
@@ -2300,26 +2349,15 @@ CreateSwapChain(
   }
   // Unified temporal Present (scaler on one path; FI encode opt-in).
   // Prefer over spatial so the same tick never runs spatial+sidecar / hybrid.
-  // Size guard (crash I / ranked defect #1): default min 256×256 so Steam
-  // overlay / helper chains (109×1, 119×37) stay Off. Override with
-  // DXMT_METALFX_UNIFIED_MIN_W / _MIN_H (set "0" to disable that axis).
+  // Size guard: default min 256×256 at Create; ResizeBuffers demotes via
+  // unifiedSizeOk (tip 13). Override DXMT_METALFX_UNIFIED_MIN_W / _MIN_H.
   if (env::getEnvVar("DXMT_METALFX_UNIFIED_TEMPORAL_INTERP") == "1") {
-    constexpr uint32_t kDefaultUnifiedMinW = 256;
-    constexpr uint32_t kDefaultUnifiedMinH = 256;
-    const std::string env_min_w = env::getEnvVar("DXMT_METALFX_UNIFIED_MIN_W");
-    const std::string env_min_h = env::getEnvVar("DXMT_METALFX_UNIFIED_MIN_H");
-    const uint32_t min_w =
-        env_min_w.empty() ? kDefaultUnifiedMinW
-                          : (uint32_t)std::strtoul(env_min_w.c_str(), nullptr, 10);
-    const uint32_t min_h =
-        env_min_h.empty() ? kDefaultUnifiedMinH
-                          : (uint32_t)std::strtoul(env_min_h.c_str(), nullptr, 10);
-    const bool size_ok =
-        (min_w == 0 || pDesc->Width >= min_w) && (min_h == 0 || pDesc->Height >= min_h);
+    const UnifiedSizeLimits lim = unifiedSizeLimits();
+    const bool size_ok = unifiedSizeOk(pDesc->Width, pDesc->Height);
     if (!size_ok) {
       WARN(
           "unified-metalfx: CreateSwapChain ", pDesc->Width, "x", pDesc->Height,
-          " below unified min ", min_w, "x", min_h, " — Off (size guard)"
+          " below unified min ", lim.min_w, "x", lim.min_h, " — Off (size guard)"
       );
     } else if (pDevice->GetMTLDevice().supportsFXTemporalScaler()) {
       if (env::getEnvVar("DXMT_METALFX_UNIFIED_FI") == "1" &&
