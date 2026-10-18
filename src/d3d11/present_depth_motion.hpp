@@ -10,6 +10,13 @@
  *     color-only unless the unified path is also selected at CreateSwapChain).
  *   DXMT_METALFX_UNIFIED_TEMPORAL_INTERP=1 — implies the same export so an
  *     attachable temporal scaler can bind color/depth/motion on Present.
+ *
+ * Diagnostic kill-switches / verbosity (ticket/12):
+ *   DXMT_PRESENT_DM_EXPORT=0 — force export off even when unified is armed.
+ *   DXMT_PRESENT_DM_VERBOSE=1 — log every Present (not just #1–3 / %300).
+ *   DXMT_PRESENT_DM_STEPS=1 — step markers inside resolve/export (also on with VERBOSE).
+ *   DXMT_PRESENT_DM_TRACKED_DEPTH=0 — never use g_tracked_depth.
+ *   DXMT_PRESENT_DM_OM_DEPTH=0 — never call OMGetRenderTargets at Present.
  */
 #pragma once
 
@@ -20,10 +27,19 @@ namespace dxmt {
 namespace present_dm {
 
 /**
- * True when DXMT_PRESENT_DEPTH_MOTION=1 or DXMT_METALFX_UNIFIED_TEMPORAL_INTERP=1.
- * Unset/0 leaves Present export untouched.
+ * True when DXMT_PRESENT_DEPTH_MOTION=1 or DXMT_METALFX_UNIFIED_TEMPORAL_INTERP=1,
+ * unless DXMT_PRESENT_DM_EXPORT=0 forces export fully off (bisection kill-switch).
  */
 bool enabled();
+
+/** DXMT_PRESENT_DM_VERBOSE=1 — every Present tick is logged. */
+bool verbose();
+
+/** Step markers when VERBOSE=1 or DXMT_PRESENT_DM_STEPS=1. */
+bool stepsEnabled();
+
+/** Emit a Present-path step marker (no-op unless stepsEnabled()). */
+void logStep(const char *step);
 
 void noteTemporalUpscale(
     ID3D11Resource *color, ID3D11Resource *depth, ID3D11Resource *motion_vector
@@ -39,6 +55,7 @@ void trackSceneDepth(ID3D11DepthStencilView *dsv);
  * Resolve a depth resource for Present export.
  * Prefer last tracked scene DSV (size-compatible with color); else OM DSV at
  * Present; else title TemporalUpscale depth. Returns AddRef'd resource when true.
+ * Kill-switches: DXMT_PRESENT_DM_TRACKED_DEPTH=0 / DXMT_PRESENT_DM_OM_DEPTH=0.
  */
 bool resolveDepthForPresent(
     ID3D11DeviceContext *ctx, UINT color_w, UINT color_h, ID3D11Resource **out_resource,

@@ -27,6 +27,7 @@
 #include "present_depth_motion.hpp"
 #include <atomic>
 #include <cfloat>
+#include <cstdlib>
 #include <format>
 
 /**
@@ -845,11 +846,16 @@ public:
       metalfx_skip_temporal_encode_this_present_ = false;
       metalfx_temporal_encode_skip_reason_.clear();
     }
+    present_dm::logStep("present1:enter");
     if (export_dm) {
+      present_dm::logStep("present1:export_dm_begin");
       if constexpr (kTemporal)
         ExportPresentDepthMotion(/*defer_present_dm_log=*/true);
       else
         ExportPresentDepthMotion(/*defer_present_dm_log=*/false, "spatial_encode=color_only");
+      present_dm::logStep("present1:export_dm_end");
+    } else {
+      present_dm::logStep("present1:export_dm_off");
     }
 
     double vsync_duration =
@@ -910,8 +916,13 @@ public:
       }
       // Ensure may (re)create scaler — that Present must skip encode (crash F class).
       // Never call Ensure during destroy cooldown (scaler must stay nullptr).
-      const bool scaler_ok =
-          !in_scaler_cooldown && bindings_ok && EnsureTemporalScaler(depth_tex, motion_tex);
+      // Bisection: DXMT_METALFX_ENSURE_SCALER=0 never creates a TemporalScaler.
+      const bool ensure_scaler_allowed =
+          env::getEnvVar("DXMT_METALFX_ENSURE_SCALER") != "0";
+      if (!ensure_scaler_allowed)
+        present_dm::logStep("present1:ensure_scaler_disabled");
+      const bool scaler_ok = !in_scaler_cooldown && bindings_ok && ensure_scaler_allowed &&
+                             EnsureTemporalScaler(depth_tex, motion_tex);
       UpdateMetalFXStabilityStreak(depth_tex, motion_tex);
       // Never MetalFX-encode in the same Present as identity/format/transition churn,
       // scaler (re)create, estimate realloc, or temporal_needs_reset_ edge.
@@ -974,6 +985,7 @@ public:
             " scaler=", (bool)metalfx_temporal_scaler_,
             ") — presenting pre-upscale backbuffer (no MetalFX page-fault)"
         );
+        present_dm::logStep("present1:emitcc_pre_upscale_begin");
         chunk->emitcc([
           this, vsync_duration, state = presenter->synchronizeLayerProperties(),
           sync_state = SyncFrame(++presentation_count_),
@@ -983,6 +995,7 @@ public:
           ReleaseSemaphore(present_semaphore_, 1, nullptr);
           this->UpdateStatistics(ctx.queue().statistics, ctx.currentFrameId());
         });
+        present_dm::logStep("present1:emitcc_pre_upscale_queued");
         rendered_present_count_++;
         presented_present_count_++;
       } else {
@@ -994,6 +1007,7 @@ public:
         const bool depth_is_estimate = depth_bind_fmt == WMTPixelFormatR32Float;
         // Capture Rc/scaler by value at emit time so a later Present recreate
         // cannot leave the queued encode holding a stale FI/scaler pointer.
+        present_dm::logStep("present1:emitcc_temporal_begin");
         chunk->emitcc([
           this, vsync_duration, half_vsync, backbuffer = backbuffer_->texture(),
           sync_state = SyncFrame(++presentation_count_),
@@ -1101,6 +1115,7 @@ public:
           ReleaseSemaphore(present_semaphore_, 1, nullptr);
           this->UpdateStatistics(ctx.queue().statistics, ctx.currentFrameId());
         });
+        present_dm::logStep("present1:emitcc_temporal_queued");
         rendered_present_count_++;
         presented_present_count_ += have_interp ? 2u : 1u;
         if ((rendered_present_count_ % 120u) == 0u) {
@@ -1116,6 +1131,7 @@ public:
         }
       }
     } else {
+      present_dm::logStep("present1:emitcc_off_begin");
       chunk->emitcc([
         this, vsync_duration, state = presenter->synchronizeLayerProperties(),
         sync_state = SyncFrame(++presentation_count_),
@@ -1125,17 +1141,25 @@ public:
         ReleaseSemaphore(present_semaphore_, 1, nullptr);
         this->UpdateStatistics(ctx.queue().statistics, ctx.currentFrameId());
       });
+      present_dm::logStep("present1:emitcc_off_queued");
     }
     // Defer prev-color history until after emitcc so GPU encode order is:
     // FrameInterpolate(reads prev) → CopyResource(prev ← current) for next tick.
-    if (export_dm)
+    if (export_dm) {
+      present_dm::logStep("present1:prev_color_update_begin");
       UpdatePresentPrevColor();
+      present_dm::logStep("present1:prev_color_update_end");
+    }
 
+    present_dm::logStep("present1:commit_begin");
     device_context_->Commit();
+    present_dm::logStep("present1:commit_end");
 
     lock.unlock(); // since PresentBoundary() will and should only stall current thread
 
+    present_dm::logStep("present1:present_boundary_begin");
     cmd_queue.PresentBoundary();
+    present_dm::logStep("present1:present_boundary_end");
 
     return hr;
   };
@@ -1924,7 +1948,9 @@ private:
   }
 
   void ExportPresentDepthMotion(bool defer_present_dm_log, const char *encode_label = nullptr) {
+    present_dm::logStep("export:enter");
     EnsurePresentPrevColorTexture();
+    present_dm::logStep("export:prev_color_ensured");
     const bool prev_valid = present_prev_color_valid_ && present_prev_color_;
     const char *depth_prov = present_dm::kDepthMissing;
     const char *motion_prov = present_dm::kMotionUnavailable;
@@ -1940,9 +1966,11 @@ private:
 
     Com<ID3D11Resource> depth_src;
     bool need_estimate_depth = true;
+    present_dm::logStep("export:resolve_depth_begin");
     if (present_dm::resolveDepthForPresent(
             device_context_, backbuffer_desc_.Width, backbuffer_desc_.Height, &depth_src, &depth_prov
         )) {
+      present_dm::logStep("export:resolve_depth_hit");
       D3D11_TEXTURE2D_DESC ddesc{};
       if (Com<ID3D11Texture2D> t; SUCCEEDED(depth_src->QueryInterface(IID_PPV_ARGS(&t)))) {
         t->GetDesc(&ddesc);
@@ -1953,6 +1981,7 @@ private:
       // allocate a new estimate while scaler/FI stay on depth_fmt=55 without
       // reset — MetalFX encode then page-faults (live crash C / D).
       if (DxgiDepthUnsuitableForMetalFX(depth_fmt)) {
+        present_dm::logStep("export:depth_unsuitable_d32s8");
         WARN(
             "unified-metalfx: real depth DXGI fmt=", (uint32_t)depth_fmt,
             " (D32S8/unsuitable) — skip copy; keep/reuse labeled R32Float "
@@ -1987,9 +2016,11 @@ private:
         need_estimate_depth = true;
         // Leave present_depth_ alone when it is already a reusable R32 estimate.
       } else if (EnsurePresentCopyTexture(present_depth_, depth_src.ptr(), 0)) {
+        present_dm::logStep("export:depth_copy_begin");
         device_context_->CopyResource(
             static_cast<ID3D11Resource *>(present_depth_.ptr()), depth_src.ptr()
         );
+        present_dm::logStep("export:depth_copy_end");
         // Belt-and-suspenders: Metal format after copy still unsuitable → estimate.
         if (present_depth_ && present_depth_->texture()) {
           WMTPixelFormat src_metal = present_depth_->texture()->pixelFormat();
@@ -2020,12 +2051,14 @@ private:
     } else {
       depth_prov = present_dm::kDepthMissing;
       need_estimate_depth = true;
+      present_dm::logStep("export:resolve_depth_miss");
       // REAL_DEPTH_MISSING: keep owned R32 estimate; never destroy it each Present
       // (that realloc churn reset temporal history and crashed FI — crash D).
     }
 
     // Real depth missing / unsuitable → labeled constant-far estimate (only after real failure).
     if (need_estimate_depth || !present_depth_) {
+      present_dm::logStep("export:estimate_depth_fill_begin");
       if (!FillLabeledDepthEstimateConstantFar(&depth_prov, &depth_fmt)) {
         present_depth_ = nullptr;
         depth_prov = present_dm::kDepthEstimateFailed;
@@ -2048,8 +2081,10 @@ private:
           LogEncodeBindStrategy("ESTIMATE_DEPTH_CONSTANT_FAR");
         }
       }
+      present_dm::logStep("export:estimate_depth_fill_end");
     } else {
       LogEncodeBindStrategy("real_depth");
+      present_dm::logStep("export:real_depth_bound");
     }
 
     // If suitable real depth replaced the estimate slot, identity may have changed.
@@ -2061,11 +2096,14 @@ private:
 
     Com<ID3D11Resource> motion_src;
     bool need_estimate_motion = true;
+    present_dm::logStep("export:resolve_motion_begin");
     if (present_dm::resolveTitleMotion(&motion_src, &motion_prov)) {
       if (EnsurePresentCopyTexture(present_motion_, motion_src.ptr(), 0)) {
+        present_dm::logStep("export:motion_copy_begin");
         device_context_->CopyResource(
             static_cast<ID3D11Resource *>(present_motion_.ptr()), motion_src.ptr()
         );
+        present_dm::logStep("export:motion_copy_end");
         need_estimate_motion = false;
       } else {
         motion_prov = present_dm::kMotionUnavailable;
@@ -2080,6 +2118,7 @@ private:
 
     // Real motion unavailable → labeled zero-MV estimate (only after real failure).
     if (need_estimate_motion || !present_motion_) {
+      present_dm::logStep("export:estimate_motion_fill_begin");
       if (!FillLabeledMotionEstimateZero(&motion_prov)) {
         present_motion_ = nullptr;
         motion_prov = present_dm::kMotionEstimateFailed;
@@ -2097,6 +2136,7 @@ private:
           );
         }
       }
+      present_dm::logStep("export:estimate_motion_fill_end");
     }
 
     Texture *motion_tex_now =
@@ -2118,6 +2158,7 @@ private:
           encode_label ? encode_label : "spatial_encode=color_only"
       );
     }
+    present_dm::logStep("export:exit");
     // Prev-color CopyResource is deferred to UpdatePresentPrevColor() after emitcc.
   }
 
@@ -2252,8 +2293,24 @@ CreateSwapChain(
   }
   // Unified temporal Present (scaler on one path; FI encode opt-in).
   // Prefer over spatial so the same tick never runs spatial+sidecar / hybrid.
+  // Bisection size gate: DXMT_METALFX_UNIFIED_MIN_W / _MIN_H (e.g. 1920 / 1080)
+  // falls tiny/helper swapchains back to Off so only primary-sized chains arm.
   if (env::getEnvVar("DXMT_METALFX_UNIFIED_TEMPORAL_INTERP") == "1") {
-    if (pDevice->GetMTLDevice().supportsFXTemporalScaler()) {
+    const uint32_t min_w = (uint32_t)std::strtoul(
+        env::getEnvVar("DXMT_METALFX_UNIFIED_MIN_W").c_str(), nullptr, 10
+    );
+    const uint32_t min_h = (uint32_t)std::strtoul(
+        env::getEnvVar("DXMT_METALFX_UNIFIED_MIN_H").c_str(), nullptr, 10
+    );
+    const bool size_ok =
+        (min_w == 0 || pDesc->Width >= min_w) && (min_h == 0 || pDesc->Height >= min_h);
+    if (!size_ok) {
+      WARN(
+          "unified-metalfx: CreateSwapChain ", pDesc->Width, "x", pDesc->Height,
+          " below DXMT_METALFX_UNIFIED_MIN_", min_w, "x", min_h,
+          " — Off (bisection size gate)"
+      );
+    } else if (pDevice->GetMTLDevice().supportsFXTemporalScaler()) {
       if (env::getEnvVar("DXMT_METALFX_UNIFIED_FI") == "1" &&
           !pDevice->GetMTLDevice().supportsFXFrameInterpolator()) {
         WARN(
