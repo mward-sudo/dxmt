@@ -283,6 +283,13 @@ mvProbeDepthConvEnabledCached() {
 bool
 mvReadbackEnabledCached() {
   static const bool v = envIsOne("DXMT_MV_PROBE_RB");
+  if (v) {
+    static const bool logged = []() {
+      WARN("unified-metalfx: mv_probe=rb_arm enabled");
+      return true;
+    }();
+    (void)logged;
+  }
   return v;
 }
 

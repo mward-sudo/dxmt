@@ -1246,19 +1246,25 @@ public:
       // Arm D RB copies must follow temporal emitcc (Crash I class: CopySubresourceRegion
       // during export leaves encoder_current set → assert !encoder_current).
       if (present_dm::mvReadbackEnabled()) [[unlikely]] {
+        // Map + copy share post-emitcc presentation_count_ (Export used present_n =
+        // count+1 before SyncFrame; using the same value here avoids period skew).
+        present_dm::logStep("present1:mv_rb_map_tick_begin");
+        present_dm::mvProbeClearPreparedLogs();
+        present_dm::noteMvReadbackMapTick(
+            device_, device_context_, presentation_count_, backbuffer_desc_.Width,
+            backbuffer_desc_.Height
+        );
         present_dm::logStep("present1:mv_rb_copy_tick_begin");
-        const uint32_t rb_log_base = present_dm::mvProbePreparedLogCount();
         present_dm::noteMvReadbackCopyTick(
             device_, device_context_, presentation_count_, backbuffer_desc_.Width,
             backbuffer_desc_.Height
         );
         const uint32_t rb_n = present_dm::mvProbePreparedLogCount();
-        for (uint32_t i = rb_log_base; i < rb_n; i++) {
+        for (uint32_t i = 0; i < rb_n; i++) {
           if (const char *line = present_dm::mvProbePreparedLogAt(i))
             LogMvProbeStrategy(line);
         }
-        if (rb_n > rb_log_base)
-          present_dm::mvProbeClearPreparedLogs();
+        present_dm::mvProbeClearPreparedLogs();
         present_dm::logStep("present1:mv_rb_copy_tick_end");
       }
     }
@@ -2485,21 +2491,10 @@ private:
           if (const char *line = present_dm::mvProbePreparedLogAt(i))
             LogMvProbeStrategy(line);
         }
-      }
-      if (present_dm::mvReadbackEnabled()) {
-        present_dm::noteMvReadbackMapTick(
-            device_, device_context_, present_n, backbuffer_desc_.Width,
-            backbuffer_desc_.Height
-        );
-        const uint32_t rb_n = present_dm::mvProbePreparedLogCount();
-        for (uint32_t i = probe_log_emitted; i < rb_n; i++) {
-          if (const char *line = present_dm::mvProbePreparedLogAt(i))
-            LogMvProbeStrategy(line);
-        }
-        /* rb_stats / copy-phase logs emit after emitcc in Present1. */
-      } else if (probe_log_emitted != 0) {
         present_dm::mvProbeClearPreparedLogs();
       }
+      // Arm D map+copy run after emitcc (see Present1) so CopySubresourceRegion
+      // cannot leave encoder_current set before temporal encode.
       present_dm::noteMvProbePresent(present_n);
     }
     present_dm::logStep("export:exit");
